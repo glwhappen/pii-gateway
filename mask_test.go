@@ -6,6 +6,7 @@ import (
 )
 
 func TestMaskAndRestore(t *testing.T) {
+	ResetPIIStore()
 	body := `{"messages":[{"role":"user","content":"我叫张三，电话13812345678，身份证110101199003071234，另一个号15098765432。"}]}`
 	m := newMapping()
 	masked := mask([]byte(body), m)
@@ -38,6 +39,7 @@ func TestMaskAndRestore(t *testing.T) {
 }
 
 func TestMaskStripsHeaderPseudonymButKeepsJSON(t *testing.T) {
+	ResetPIIStore()
 	// 占位符不应破坏 JSON 结构（引号/冒号/括号保持原样）
 	body := `{"user":"13800001111","age":30}`
 	m := newMapping()
@@ -52,7 +54,49 @@ func TestMaskStripsHeaderPseudonymButKeepsJSON(t *testing.T) {
 	}
 }
 
+// 同一内容（同一手机号/身份证）跨请求必须复用同一占位符；不同内容必须不同。
+func TestDeterministicMapping(t *testing.T) {
+	ResetPIIStore()
+
+	m1 := newMapping()
+	ph1 := string(mask([]byte("13812345678"), m1))
+
+	m2 := newMapping()
+	ph2 := string(mask([]byte("13812345678"), m2))
+
+	if ph1 != ph2 {
+		t.Fatalf("same PII got different placeholders: %q vs %q", ph1, ph2)
+	}
+	// 各自都能还原
+	if string(restore([]byte(ph1), m1)) != "13812345678" {
+		t.Fatalf("restore via m1 failed")
+	}
+	if string(restore([]byte(ph2), m2)) != "13812345678" {
+		t.Fatalf("restore via m2 failed")
+	}
+
+	// 不同 PII 占位符必须不同
+	m3 := newMapping()
+	ph3 := string(mask([]byte("13999999999"), m3))
+	if ph3 == ph1 {
+		t.Fatalf("different PII got same placeholder: %q", ph3)
+	}
+
+	// 同一请求内同一内容出现多次，MaskedCount 只计 1
+	m4 := newMapping()
+	masked4 := mask([]byte("号码13812345678，另一个也13812345678"), m4)
+	if m4.MaskedCount() != 1 {
+		t.Fatalf("expected 1 unique PII, got %d in %s", m4.MaskedCount(), masked4)
+	}
+	// 且还原能还原所有出现位置
+	restored4 := string(restore(masked4, m4))
+	if !strings.Contains(restored4, "13812345678") {
+		t.Fatalf("restore failed: %s", restored4)
+	}
+}
+
 func TestRestoreStreamLine(t *testing.T) {
+	ResetPIIStore()
 	// 模拟 SSE 中占位符跨行不发生时，单行还原
 	m := newMapping()
 	masked := mask([]byte("13812345678"), m)

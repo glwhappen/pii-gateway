@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -18,6 +19,46 @@ var phoneRe = regexp.MustCompile(`1[3-9][0-9]{9}`)
 var idCardRe = regexp.MustCompile(`(?i)[0-9]{17}[0-9X]`)
 
 var pidCounter atomic.Uint64
+
+// piiStore 保存 真实值 <-> 占位符 的全局映射，保证同一内容跨请求复用同一占位符。
+// 进程内存级持久：同一内容不管对话多少次都用同一个占位符；进程重启后清空。
+// （如需跨重启持久可落盘，见 README 局限一节。）
+type piiStore struct {
+	mu      sync.Mutex
+	real2ph map[string]string
+	ph2real map[string]string
+}
+
+var globalStore = newPIIStore()
+
+func newPIIStore() *piiStore {
+	return &piiStore{real2ph: make(map[string]string), ph2real: make(map[string]string)}
+}
+
+func (s *piiStore) lookup(real string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ph, ok := s.real2ph[real]
+	return ph, ok
+}
+
+func (s *piiStore) remember(real, ph string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.real2ph[real] = ph
+	s.ph2real[ph] = real
+}
+
+func (s *piiStore) size() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.real2ph)
+}
+
+// ResetPIIStore 清空全局映射（供测试或管理面板调用）。
+func ResetPIIStore() {
+	globalStore = newPIIStore()
+}
 
 // mapping 保存 占位符 -> 真实值，用于响应还原。
 type mapping struct {
@@ -51,10 +92,18 @@ func maskOne(real string, m *mapping) string {
 	if placeholderRe.MatchString(real) {
 		return real
 	}
-	n := pidCounter.Add(1)
-	ph := "[[PID_" + strconv.FormatUint(n, 10) + "]]"
-	m.real[ph] = real
-	m.items = append(m.items, ph, real)
+	// 同一内容跨请求复用同一占位符（确定性脱敏）
+	ph, ok := globalStore.lookup(real)
+	if !ok {
+		n := pidCounter.Add(1)
+		ph = "[[PID_" + strconv.FormatUint(n, 10) + "]]"
+		globalStore.remember(real, ph)
+	}
+	// 记入本请求 mapping（还原用）；同一真实值只记一次，避免重复计数
+	if _, exists := m.real[ph]; !exists {
+		m.real[ph] = real
+		m.items = append(m.items, ph, real)
+	}
 	return ph
 }
 

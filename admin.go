@@ -97,12 +97,13 @@ func startAdmin() {
 
 func adminHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
-		"status":      "ok",
-		"listen":      listenAddr,
-		"target":      targetBase,
-		"admin":       adminAddr,
-		"log_entries": logs.count(),
-		"now":         time.Now().Format(time.RFC3339),
+		"status":       "ok",
+		"listen":       listenAddr,
+		"target":       targetBase,
+		"admin":        adminAddr,
+		"log_entries":  logs.count(),
+		"mapping_size": globalStore.size(),
+		"now":          time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -220,6 +221,7 @@ async function refresh(){
       ['监听端口', h.listen],
       ['转发目标', '<span class="pill line">'+h.target+'</span>'],
       ['日志条数', h.log_entries],
+      ['映射条目', h.mapping_size],
       ['当前时间', h.now]
     ].map(([k,v])=>'<div class="card"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>').join('');
   }catch(e){ $$('stats').innerHTML='<div class="card"><div class="k">管理端</div><div class="v err">'+e+'</div></div>'; }
