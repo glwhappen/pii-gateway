@@ -89,6 +89,8 @@ func startAdmin() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveAdminPage)
 	mux.HandleFunc("/api/health", adminHealth)
+	mux.HandleFunc("/api/login", adminLogin)
+	mux.HandleFunc("/api/logout", adminLogout)
 	mux.HandleFunc("/api/logs", authWrap(adminLogs))
 	mux.HandleFunc("/api/rules", authWrap(adminRules))
 	mux.HandleFunc("/api/rules/update", authWrap(adminRuleUpdate))
@@ -110,27 +112,81 @@ func startAdmin() {
 	}
 }
 
+// adminCookie 登录态 cookie 名。登录成功后设置 HttpOnly cookie，避免浏览器导航丢失 Authorization 头。
+const adminCookie = "pii_admin_token"
+
+// authed 判断请求是否已通过鉴权（Authorization 头 或 cookie）。
+func authed(r *http.Request, token string) bool {
+	if token == "" {
+		return true // 未启用鉴权，始终放行
+	}
+	auth := r.Header.Get("Authorization")
+	if auth == "Bearer "+token || auth == "bearer "+token {
+		return true
+	}
+	if c, err := r.Cookie(adminCookie); err == nil && c.Value == token {
+		return true
+	}
+	if r.URL.Query().Get("token") == token {
+		return true
+	}
+	return false
+}
+
 // authWrap 为管理面板 API 添加 Bearer Token 鉴权。未配置 token 时放行（向后兼容）。
 func authWrap(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimSpace(appCfg.AdminToken())
-		if token == "" {
-			h(w, r)
-			return
-		}
-		auth := r.Header.Get("Authorization")
-		if auth == "Bearer "+token || auth == "bearer "+token {
-			h(w, r)
-			return
-		}
-		// 兼容查询参数 token=xxx（便于 curl/脚本）。
-		if r.URL.Query().Get("token") == token {
+		if authed(r, token) {
 			h(w, r)
 			return
 		}
 		w.Header().Set("WWW-Authenticate", `Bearer realm="pii-gateway-admin"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	}
+}
+
+// adminLogin 校验 token，成功后设置登录 cookie。仅当配置了 AdminToken 时有效。
+func adminLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token := strings.TrimSpace(appCfg.AdminToken())
+	if token == "" {
+		writeJSON(w, map[string]any{"ok": true})
+		return
+	}
+	var req struct {
+		Token string `json:"token"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.Token != token {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     adminCookie,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   60 * 60 * 24 * 7, // 7 天
+	})
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// adminLogout 清除登录 cookie。
+func adminLogout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     adminCookie,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func adminHealth(w http.ResponseWriter, r *http.Request) {
@@ -1377,14 +1433,11 @@ func serveAdminPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := strings.TrimSpace(appCfg.AdminToken())
-	if token != "" {
-		auth := r.Header.Get("Authorization")
-		if auth != "Bearer "+token && auth != "bearer "+token {
-			// 未鉴权：返回登录页，前端提交 token 后携带 Authorization 重新加载。
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			fmt.Fprint(w, adminLoginHTML)
-			return
-		}
+	if token != "" && !authed(r, token) {
+		// 未鉴权：返回登录页，前端提交 token 后设置 cookie 并重新加载。
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, adminLoginHTML)
+		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, adminPageHTML)
@@ -1421,10 +1474,9 @@ button:hover{background:#4338ca}
 function doLogin(){
   const tok = document.getElementById('tok').value.trim();
   if(!tok) return;
-  fetch('/', {headers:{'Authorization':'Bearer '+tok}})
+  fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:tok})})
     .then(r => {
-      if(r.ok && r.headers.get('content-type') && r.headers.get('content-type').includes('html')){
-        localStorage.setItem('pii_admin_token', tok);
+      if(r.ok){
         location.reload();
       } else {
         document.getElementById('err').style.display='block';
