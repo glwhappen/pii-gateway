@@ -14,8 +14,8 @@ import (
 )
 
 var (
-	listenAddr = envOr("PII_LISTEN", ":3001")
-	targetBase = envOr("PII_TARGET", "http://localhost:3000")
+	// 由 appCfg.load() / applyConfig 在启动时设置
+	listenAddr = ":3001"
 )
 
 // hop-by-hop 头不能透传
@@ -35,6 +35,7 @@ var hopHeaders = map[string]bool{
 }
 
 func main() {
+	appCfg.load()
 	if err := globalStore.loadFile(piiStoreFile); err != nil {
 		log.Printf("load pii store %s: %v", piiStoreFile, err)
 	}
@@ -42,7 +43,7 @@ func main() {
 		log.Printf("load rules %s: %v", rulesFile, err)
 	}
 	go startAdmin()
-	log.Printf("pii-gateway listening on %s, forwarding to %s", listenAddr, targetBase)
+	log.Printf("pii-gateway listening on %s, forwarding to %s", listenAddr, appCfg.Target())
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -84,7 +85,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	masked := mask(rawBody, m)
 
 	// 2. 重建请求转发到 new-api
-	proxyReq, err := http.NewRequest(r.Method, targetBase+r.URL.String(), bytes.NewReader(masked))
+	proxyReq, err := http.NewRequest(r.Method, appCfg.Target()+r.URL.String(), bytes.NewReader(masked))
 	if err != nil {
 		status = http.StatusBadGateway
 		http.Error(w, "build request: "+err.Error(), status)

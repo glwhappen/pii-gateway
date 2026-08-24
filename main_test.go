@@ -37,9 +37,9 @@ func TestEndToEndStream(t *testing.T) {
 	}))
 	defer fake.Close()
 
-	old := targetBase
-	targetBase = fake.URL
-	defer func() { targetBase = old }()
+	old := appCfg.Target()
+	appCfg.SetTarget(fake.URL)
+	defer func() { _ = appCfg.SetTarget(old) }()
 
 	gw := httptest.NewServer(http.HandlerFunc(handleProxy))
 	defer gw.Close()
@@ -90,9 +90,9 @@ func TestEndToEndStreamSplit(t *testing.T) {
 	}))
 	defer fake.Close()
 
-	old := targetBase
-	targetBase = fake.URL
-	defer func() { targetBase = old }()
+	old := appCfg.Target()
+	appCfg.SetTarget(fake.URL)
+	defer func() { _ = appCfg.SetTarget(old) }()
 
 	gw := httptest.NewServer(http.HandlerFunc(handleProxy))
 	defer gw.Close()
@@ -130,9 +130,9 @@ func TestEndToEndNonStream(t *testing.T) {
 	}))
 	defer fake.Close()
 
-	old := targetBase
-	targetBase = fake.URL
-	defer func() { targetBase = old }()
+	old := appCfg.Target()
+	appCfg.SetTarget(fake.URL)
+	defer func() { _ = appCfg.SetTarget(old) }()
 
 	gw := httptest.NewServer(http.HandlerFunc(handleProxy))
 	defer gw.Close()

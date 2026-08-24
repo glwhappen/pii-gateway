@@ -87,6 +87,7 @@ func startAdmin() {
 	mux.HandleFunc("/api/logs", adminLogs)
 	mux.HandleFunc("/api/rules", adminRules)
 	mux.HandleFunc("/api/rules/remove", adminRuleRemove)
+	mux.HandleFunc("/api/config", adminConfig)
 	mux.HandleFunc("/api/mappings", adminMappings)
 	mux.HandleFunc("/api/mappings/clear", adminMappingsClear)
 	mux.HandleFunc("/api/self-test", adminSelfTest)
@@ -100,7 +101,7 @@ func adminHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"status":       "ok",
 		"listen":       listenAddr,
-		"target":       targetBase,
+		"target":       appCfg.Target(),
 		"admin":        adminAddr,
 		"log_entries":  logs.count(),
 		"mapping_size": globalStore.size(),
@@ -110,6 +111,56 @@ func adminHealth(w http.ResponseWriter, r *http.Request) {
 
 func adminLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, logs.list())
+}
+
+// adminConfig 读取/设置运行配置。
+func adminConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		c := appCfg.Get()
+		writeJSON(w, map[string]any{
+			"forward_target": c.ForwardTarget,
+			"listen_addr":    c.ListenAddr,
+			"admin_addr":     c.AdminAddr,
+			"store_file":     c.StoreFile,
+			"rules_file":     c.RulesFile,
+		})
+	case http.MethodPost:
+		adminConfigSet(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// adminConfigSet 设置转发目标（热生效）；端口/文件类改动保存但需重启。
+func adminConfigSet(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ForwardTarget string `json:"forward_target"`
+		ListenAddr    string `json:"listen_addr"`
+		AdminAddr     string `json:"admin_addr"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	c := appCfg.Get()
+	restart := false
+	if t := strings.TrimSpace(req.ForwardTarget); t != "" {
+		c.ForwardTarget = t
+	}
+	if l := strings.TrimSpace(req.ListenAddr); l != "" && l != c.ListenAddr {
+		c.ListenAddr = l
+		restart = true
+	}
+	if a := strings.TrimSpace(req.AdminAddr); a != "" && a != c.AdminAddr {
+		c.AdminAddr = a
+		restart = true
+	}
+	if err := appCfg.Save(c); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "restart_required": restart})
 }
 
 func adminRules(w http.ResponseWriter, r *http.Request) {
@@ -262,9 +313,13 @@ const adminPageHTML = `<!doctype html>
 <title>PII 脱敏网关</title>
 <style>
 :root{--bg:#0f1117;--card:#181b25;--line:#262a38;--fg:#e6e8ee;--muted:#8b90a0;--ok:#34d399;--warn:#fbbf24;--err:#f87171;--accent:#6366f1}
+body.theme-light{--bg:#f6f8fb;--card:#ffffff;--line:#e5e8ee;--fg:#1f2430;--muted:#68707f;--ok:#059669;--warn:#b45309;--err:#dc2626;--accent:#4f46e5}
 *{box-sizing:border-box}body{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);color:var(--fg);font-size:14px}
 .wrap{max-width:1100px;margin:0 auto;padding:24px}
 h1{font-size:20px;margin:0 0 4px}.sub{color:var(--muted);margin-bottom:20px}
+.top{display:flex;justify-content:space-between;align-items:flex-start}
+.theme-btn{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer;font-size:13px}
+.theme-btn:hover{opacity:.85}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:20px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
 .card .k{color:var(--muted);font-size:12px;margin-bottom:6px}.card .v{font-size:18px}
@@ -292,10 +347,32 @@ a{color:var(--accent)}
 </head>
 <body>
 <div class="wrap">
-  <h1>🔐 PII 脱敏网关</h1>
-  <div class="sub">在 LLM 网关前自动脱敏手机号/身份证，响应自动还原 · 管理端口 <span id="adminAddr">—</span></div>
+  <div class="top">
+    <div>
+      <h1>🔐 PII 脱敏网关</h1>
+      <div class="sub">在 LLM 网关前自动脱敏手机号/身份证，响应自动还原 · 管理端口 <span id="adminAddr">—</span></div>
+    </div>
+    <button class="theme-btn" id="themeBtn" onclick="toggleTheme()">🌙 深色</button>
+  </div>
 
   <div class="grid" id="stats"></div>
+
+  <div class="panel">
+    <h2>⚙️ 设置 <span class="muted">(转发目标热生效；端口改动需重启)</span></h2>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      <span class="muted" style="min-width:70px">转发目标</span>
+      <input id="cfgTarget" class="inp" style="flex:1;min-width:240px" placeholder="http://172.17.0.1:3029">
+      <button onclick="saveConfig()">💾 保存</button>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
+      <span class="muted" style="min-width:70px">代理端口</span>
+      <input id="cfgListen" class="inp" style="width:120px">
+      <span class="muted" style="margin-left:12px">管理端口</span>
+      <input id="cfgAdmin" class="inp" style="width:120px">
+    </div>
+    <div class="muted">映射文件 <span id="cfgStore"></span> · 规则文件 <span id="cfgRules"></span></div>
+    <div id="cfgMsg" style="margin-top:8px"></div>
+  </div>
 
   <div class="panel">
     <h2>🧪 脱敏自测（不调模型，直接演示）</h2>
@@ -433,9 +510,40 @@ async function clearMappings(){
   }catch(e){ alert('清除失败: '+e) }
 }
 
+function applyTheme(t){
+  document.body.classList.toggle('theme-light', t==='light');
+  localStorage.setItem('pii_theme', t);
+  $$('themeBtn').textContent = t==='light'? '☀️ 浅色' : '🌙 深色';
+}
+function toggleTheme(){ applyTheme(localStorage.getItem('pii_theme')==='light'?'dark':'light'); }
+
+async function loadConfig(){
+  try{
+    const c = await j('/api/config');
+    $$('cfgTarget').value = c.forward_target;
+    $$('cfgListen').value = c.listen_addr;
+    $$('cfgAdmin').value = c.admin_addr;
+    $$('cfgStore').textContent = c.store_file;
+    $$('cfgRules').textContent = c.rules_file;
+  }catch(e){}
+}
+async function saveConfig(){
+  const body = {
+    forward_target: $$('cfgTarget').value.trim(),
+    listen_addr: $$('cfgListen').value.trim(),
+    admin_addr: $$('cfgAdmin').value.trim()
+  };
+  try{
+    const r = await j('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    $$('cfgMsg').innerHTML = r.restart_required? '<span class="err">已保存：端口改动需重启后生效</span>' : '<span class="okc">已保存：转发目标已生效</span>';
+    loadConfig(); refresh();
+  }catch(e){ $$('cfgMsg').innerHTML='<span class="err">保存失败: '+e+'</span>' }
+}
+
 refresh();
-setInterval(()=>{ refresh(); loadMappings(); loadRules(); }, 1500);
-loadMappings(); loadRules();
+setInterval(()=>{ refresh(); loadMappings(); loadRules(); loadConfig(); }, 1500);
+loadMappings(); loadRules(); loadConfig();
+applyTheme(localStorage.getItem('pii_theme')||'dark');
 </script>
 </body>
 </html>

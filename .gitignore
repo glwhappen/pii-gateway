@@ -8,6 +8,7 @@ logs/
 
 # 本地运行数据
 /pii-store.json
+/config.json
 /.pi/
 
 # 编辑器
