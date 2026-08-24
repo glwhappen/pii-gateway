@@ -45,6 +45,7 @@ func main() {
 	if err := selftestHist.load(); err != nil {
 		log.Printf("load self-test history %s: %v", selftestHistFile, err)
 	}
+	go startDemo() // 演示站点（PII_DEMO 为空则不启用）
 	go startAdmin()
 	log.Printf("pii-gateway listening on %s, forwarding to %s", listenAddr, appCfg.Target())
 	mux := http.NewServeMux()

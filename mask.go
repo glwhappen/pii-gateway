@@ -20,6 +20,7 @@ type piiStore struct {
 	real2ph map[string]string
 	ph2real map[string]string
 	ignored map[string]bool // 被忽略的真实值：不再参与脱敏（保留记录，可取消忽略）
+	persist bool            // false 则不落盘（用于演示等隔离场景）
 }
 
 var globalStore = newPIIStore()
@@ -28,7 +29,12 @@ var globalStore = newPIIStore()
 var piiStoreFile = envOr("PII_STORE_FILE", "pii-store.json")
 
 func newPIIStore() *piiStore {
-	return &piiStore{real2ph: make(map[string]string), ph2real: make(map[string]string), ignored: make(map[string]bool)}
+	return &piiStore{real2ph: make(map[string]string), ph2real: make(map[string]string), ignored: make(map[string]bool), persist: true}
+}
+
+// newNoPersistStore 返回不落盘的隔离 store（演示用，避免污染生产映射/磁盘）。
+func newNoPersistStore() *piiStore {
+	return &piiStore{real2ph: make(map[string]string), ph2real: make(map[string]string), ignored: make(map[string]bool), persist: false}
 }
 
 func (s *piiStore) lookup(real string) (string, bool) {
@@ -184,10 +190,16 @@ func newMapping() *mapping {
 	return &mapping{real: make(map[string]string)}
 }
 
-// mask 将 body 中的 PII 替换为占位符，并记录 占位符->真实值 映射。
-// 1. 按全局规则（可配置正则，默认手机号/身份证）逐个替换；
-// 2. 手动添加的自定义真实值（不匹配任何规则，如 1111）也在 body 出现时替换。
+// mask 将 body 中的 PII 替换为占位符（使用全局持久 store）。
 func mask(body []byte, m *mapping) []byte {
+	return maskWith(globalStore, body, m)
+}
+
+// maskWith 与 mask 相同，但使用传入的 store（可隔离、可禁止落盘）。
+// 1. 按全局规则（可配置正则）逐个替换；
+// 2. 敏感名单（姓名等）出现即替换；
+// 3. 手动添加的自定义值（不匹配任何规则）出现即替换。
+func maskWith(st *piiStore, body []byte, m *mapping) []byte {
 	s := string(body)
 	for _, r := range globalRules.all() {
 		if r.re == nil {
@@ -195,24 +207,24 @@ func mask(body []byte, m *mapping) []byte {
 		}
 		typ := r.Type
 		s = r.re.ReplaceAllStringFunc(s, func(x string) string {
-			return maskOne(x, m, typ)
+			return maskOne(st, x, m, typ)
 		})
 	}
 	// 敏感名单（姓名等）：正文出现即掩码，确定性复用同一占位符。
 	// 按长度降序处理，避免短名先替换长名内的子串。
 	for _, nm := range sortedNames() {
-		if globalStore.isIgnored(nm) {
+		if st.isIgnored(nm) {
 			continue // 该词已被忽略，不脱敏
 		}
 		if !strings.Contains(s, nm) {
 			continue
 		}
-		ph, ok := globalStore.lookup(nm)
+		ph, ok := st.lookup(nm)
 		if !ok {
 			n := pidCounter.Add(1)
 			ph = phFor("NAME", n)
-			if globalStore.remember(nm, ph) {
-				_ = globalStore.saveFile(piiStoreFile)
+			if st.remember(nm, ph) && st.persist {
+				_ = st.saveFile(piiStoreFile)
 			}
 		}
 		s = strings.ReplaceAll(s, nm, ph)
@@ -225,7 +237,7 @@ func mask(body []byte, m *mapping) []byte {
 	// 注意：manualEntries 来自 map 迭代顺序不确定，必须按真实值长度降序排序后再替换，
 	// 否则短值（如 123）可能先替换长值（如 1234）里的子串，把 1234 拆开残留明文。
 	// 长值优先 + ReplaceAll 贪心替换，保证任一被包含的短值不会破坏长值。
-	manual := globalStore.manualEntries()
+	manual := st.manualEntries()
 	sort.Slice(manual, func(i, j int) bool { return len(manual[i].Real) > len(manual[j].Real) })
 	for _, e := range manual {
 		if strings.Contains(s, e.Real) {
@@ -272,22 +284,22 @@ func (s *piiStore) manualEntries() []mappingEntry {
 	return out
 }
 
-func maskOne(real string, m *mapping, typ string) string {
+func maskOne(st *piiStore, real string, m *mapping, typ string) string {
 	// 已替换过的占位符不再重复处理
 	if placeholderRe.MatchString(real) {
 		return real
 	}
 	// 该真实值已被忽略：不脱敏，保留明文
-	if globalStore.isIgnored(real) {
+	if st.isIgnored(real) {
 		return real
 	}
 	// 同一内容跨请求复用同一占位符（确定性脱敏）
-	ph, ok := globalStore.lookup(real)
+	ph, ok := st.lookup(real)
 	if !ok {
 		n := pidCounter.Add(1)
 		ph = phFor(typ, n)
-		if globalStore.remember(real, ph) {
-			_ = globalStore.saveFile(piiStoreFile) // 新增映射立即落盘
+		if st.remember(real, ph) && st.persist {
+			_ = st.saveFile(piiStoreFile) // 新增映射立即落盘
 		}
 	}
 	// 记入本请求 mapping（还原用）；同一真实值只记一次，避免重复计数
