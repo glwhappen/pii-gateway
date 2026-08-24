@@ -1,5 +1,10 @@
 # PII 脱敏网关（pii-gateway）
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/Go-1.22-blue.svg)](go.mod)
+[![Language](https://img.shields.io/badge/language-Go-00ADD8.svg)](go.mod)
+[![GitHub stars](https://img.shields.io/github/stars/glwhappen/pii-gateway)](https://github.com/glwhappen/pii-gateway)
+
 在 new-api（或其他 LLM API 网关）**前面**加一层独立反向代理：
 - **请求方向**：把手机号、身份证等 PII 替换为占位符，再转发给 new-api。
 - **响应方向**：把模型返回里的占位符还原成真实值，再返回给客户端。
