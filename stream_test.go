@@ -242,3 +242,94 @@ func TestE2EStreamPlainTextFallback(t *testing.T) {
 		t.Fatalf("placeholder leaked: %s", out)
 	}
 }
+
+// 模型把占位符的 < > 输出成 JSON 转义形式(\u003c \u003e)，例如
+// "\u003c\u003cPII:NAME:31\u003e\u003e"，且被拆到多个 data 行。
+// 网关必须先反转义再跨行拼接，否则 carry 无法积累，占位符还原失败。
+func TestE2EStreamEscapedPlaceholderCharwise(t *testing.T) {
+	ResetPIIStore()
+	body := `{"messages":[{"role":"user","content":"手机13888990011"}]}`
+	up := newE2EUpstream(func(phs []string) []string {
+		ph := phs[0] // 例如 <<PII:PHONE:1>>
+		// 转义尖括号；\u003c / \u003e 是完整转义序列(模型不会拆开)，普通字符逐字拆
+		escaped := strings.ReplaceAll(ph, "<", `\u003c`)
+		escaped = strings.ReplaceAll(escaped, ">", `\u003e`)
+		var chunks []string
+		for i := 0; i < len(escaped); {
+			if strings.HasPrefix(escaped[i:], `\u`) {
+				chunks = append(chunks, escaped[i:i+6])
+				i += 6
+			} else {
+				chunks = append(chunks, escaped[i:i+1])
+				i++
+			}
+		}
+		var lines []string
+		for _, c := range chunks {
+			lines = append(lines, sseContent(c))
+		}
+		lines = append(lines, sseContent("，请保密"))
+		lines = append(lines, "data: [DONE]")
+		return lines
+	})
+	out := runGatewayE2E(t, up, body)
+	if !strings.Contains(out, "13888990011") {
+		t.Fatalf("escaped placeholder not restored: %s", out)
+	}
+	if strings.Contains(out, `\u003c`) || strings.Contains(out, `\u003e`) {
+		t.Fatalf("escaped seq leaked: %s", out)
+	}
+	if strings.Contains(out, "<<PII:") || strings.Contains(out, "<<PI") || strings.Contains(out, "<<P") {
+		t.Fatalf("placeholder leaked: %s", out)
+	}
+	if !strings.Contains(out, "请保密") {
+		t.Fatalf("trailing text lost: %s", out)
+	}
+}
+
+// 转义占位符以不定长片段输出。\u003c / \u003e 是完整转义序列（模型不会拆开），
+// 因此把每个转义序列当整体，其余单字符按不定长分组，模拟真实分块。
+func TestE2EStreamEscapedPlaceholderMultiChunk(t *testing.T) {
+	ResetPIIStore()
+	body := `{"messages":[{"role":"user","content":"电话0755-12345678"}]}`
+	up := newE2EUpstream(func(phs []string) []string {
+		ph := phs[0] // 例如 <<PII:LANDLINE:1>>
+		escaped := strings.ReplaceAll(ph, "<", `\u003c`)
+		escaped = strings.ReplaceAll(escaped, ">", `\u003e`)
+		// 按转义序列整体 + 普通字符分组（转义序列不分拆）
+		var parts []string
+		for i := 0; i < len(escaped); {
+			if strings.HasPrefix(escaped[i:], `\u`) {
+				parts = append(parts, escaped[i:i+6]) // \u003c / \u003e 共6字符
+				i += 6
+			} else {
+				parts = append(parts, escaped[i:i+1])
+				i++
+			}
+		}
+		// 合并成若干不定长块（每块 1~4 个逻辑单元）
+		var merged []string
+		for i := 0; i < len(parts); {
+			n := 1 + i%4
+			end := i + n
+			if end > len(parts) {
+				end = len(parts)
+			}
+			merged = append(merged, strings.Join(parts[i:end], ""))
+			i = end
+		}
+		var lines []string
+		for _, p := range merged {
+			lines = append(lines, sseContent(p))
+		}
+		lines = append(lines, "data: [DONE]")
+		return lines
+	})
+	out := runGatewayE2E(t, up, body)
+	if !strings.Contains(out, "0755-12345678") {
+		t.Fatalf("escaped multi-chunk not restored: %s", out)
+	}
+	if strings.Contains(out, `\u003c`) || strings.Contains(out, "<<PII:") || strings.Contains(out, "<<PI") {
+		t.Fatalf("placeholder leaked: %s", out)
+	}
+}
