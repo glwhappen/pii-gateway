@@ -980,6 +980,13 @@ function switchTab(name){
   document.querySelectorAll('.tab-btn').forEach(b=>{
     b.classList.toggle('active', b.getAttribute('data-tabbtn')===name);
   });
+  // 按需加载当前 tab 的数据，不做后台轮询
+  if(name==='overview') refresh();
+  else if(name==='settings') loadConfig();
+  else if(name==='rules') loadRules();
+  else if(name==='names') loadNames();
+  else if(name==='mappings') loadMappings();
+  // selftest 无需预加载
 }
 
 function applyTheme(t){
@@ -1022,10 +1029,13 @@ async function saveConfig(){
   }catch(e){ $$('cfgMsg').innerHTML='<span class="err">保存失败: '+e+'</span>' }
 }
 
-refresh();
-setInterval(()=>{ refresh(); loadMappings(); loadRules(); loadConfig(); loadNames(); }, 1500);
-loadMappings(); loadRules(); loadConfig(); loadNames();
+// 配置类数据(规则/名单/映射/设置)按需加载，不做轮询；
+// 仅日志实时刷新，且只在概览 tab 激活时拉取，降低到 2s。
 switchTab('overview');
+setInterval(()=>{
+  const active = document.querySelector('.tab-btn.active');
+  if(active && active.getAttribute('data-tabbtn')==='overview') refresh();
+}, 2000);
 applyTheme(localStorage.getItem('pii_theme')||'light');
 </script>
 </body>
