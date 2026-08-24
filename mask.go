@@ -228,15 +228,7 @@ func mask(body []byte, m *mapping) []byte {
 // 3. 手动添加的自定义值（不匹配任何规则）出现即替换。
 func maskWith(st *piiStore, body []byte, m *mapping) []byte {
 	s := string(body)
-	for _, r := range globalRules.all() {
-		if r.re == nil {
-			continue
-		}
-		typ := r.Type
-		s = r.re.ReplaceAllStringFunc(s, func(x string) string {
-			return maskOne(st, x, m, typ)
-		})
-	}
+	s = maskRules(st, s, m)
 	// 敏感名单（姓名等）：正文出现即掩码，确定性复用同一占位符。
 	// 按长度降序处理，避免短名先替换长名内的子串。
 	for _, nm := range sortedNames() {
@@ -309,6 +301,64 @@ func (s *piiStore) manualEntries() []mappingEntry {
 		out = append(out, mappingEntry{Placeholder: ph, Real: real})
 	}
 	return out
+}
+
+// maskRules 用所有正则规则扫描正文，找出全部匹配区间，重叠时保留「最长」的匹配
+// （更精确），然后按原文位置从左到右替换。避免短规则（如银行卡 4\d{15}）截断
+// 长规则（如 18 位身份证 [0-9]{17}[0-9X]）。
+func maskRules(st *piiStore, s string, m *mapping) string {
+	type span struct {
+		start, end int
+		real, typ  string
+	}
+	var spans []span
+	for _, r := range globalRules.all() {
+		if r.re == nil {
+			continue
+		}
+		for _, loc := range r.re.FindAllStringIndex(s, -1) {
+			spans = append(spans, span{loc[0], loc[1], s[loc[0]:loc[1]], r.Type})
+		}
+	}
+	if len(spans) == 0 {
+		return s
+	}
+	// 长度降序，长度相同时靠左优先（稳定）。
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].end-spans[i].start != spans[j].end-spans[j].start {
+			return spans[i].end-spans[i].start > spans[j].end-spans[j].start
+		}
+		return spans[i].start < spans[j].start
+	})
+	// 从长到短筛出「不与其他已采纳区间重叠」的最终区间。
+	accepted := make([]span, 0, len(spans))
+	for _, sp := range spans {
+		overlap := false
+		for _, a := range accepted {
+			if sp.start < a.end && a.start < sp.end {
+				overlap = true
+				break
+			}
+		}
+		if !overlap {
+			accepted = append(accepted, sp)
+		}
+	}
+	// 按原文位置从左到右替换。
+	sort.Slice(accepted, func(i, j int) bool { return accepted[i].start < accepted[j].start })
+	var b strings.Builder
+	b.Grow(len(s))
+	prev := 0
+	for _, sp := range accepted {
+		if sp.start < prev {
+			continue
+		}
+		b.WriteString(s[prev:sp.start])
+		b.WriteString(maskOne(st, sp.real, m, sp.typ))
+		prev = sp.end
+	}
+	b.WriteString(s[prev:])
+	return b.String()
 }
 
 func maskOne(st *piiStore, real string, m *mapping, typ string) string {

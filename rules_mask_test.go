@@ -202,3 +202,57 @@ func TestMaskRepeatedPII(t *testing.T) {
 		t.Fatalf("roundtrip mismatch:\n got: %s\nwant: %s", restored, text)
 	}
 }
+
+// 4 开头的 18 位身份证不应被银行卡规则(4\d{15})截断成银行卡+残留明文。
+// 身份证 [0-9]{17}[0-9X] 与银行卡 4\d{15} 重叠时，应按"最长匹配优先"识别为身份证。
+func TestMaskIDCardNotTruncatedByBankCard(t *testing.T) {
+	ResetPIIStore()
+	ids := []string{
+		"41052119980219553X", // 4 开头 18 位（Visa 卡前缀恰好重叠）
+		"45080319990821666X", // 4 开头 18 位
+		"110101199003071234", // 1 开头 18 位（无冲突）
+	}
+	for _, id := range ids {
+		text := "身份证" + id
+		m := newMapping()
+		masked := mask([]byte(text), m)
+		ms := string(masked)
+		if strings.Contains(ms, id) {
+			t.Fatalf("idcard not masked: %s", ms)
+		}
+		if !strings.Contains(ms, "<<PII:IDCARD:") {
+			t.Fatalf("idcard should be IDCARD placeholder, got: %s", ms)
+		}
+		if strings.Contains(ms, "<<PII:BANKCARD:") {
+			t.Fatalf("idcard wrongly tagged as BANKCARD: %s", ms)
+		}
+		// 必须是单个占位符，无明文残留（3X 等尾巴）
+		if n := len(placeholderRe.FindAllString(ms, -1)); n != 1 {
+			t.Fatalf("expected 1 placeholder, got %d: %s", n, ms)
+		}
+		restored := string(restore(masked, m))
+		if restored != text {
+			t.Fatalf("roundtrip mismatch:\n got: %s\nwant: %s", restored, text)
+		}
+	}
+}
+
+// 真实 19 位银联卡仍应整体识别为银行卡（不被身份证规则截断）。
+func TestMaskBankCardStillWhole(t *testing.T) {
+	ResetPIIStore()
+	card := "6222021234567890123"
+	text := "卡号" + card
+	m := newMapping()
+	masked := mask([]byte(text), m)
+	ms := string(masked)
+	if !strings.Contains(ms, "<<PII:BANKCARD:") {
+		t.Fatalf("bank card should be BANKCARD: %s", ms)
+	}
+	if n := len(placeholderRe.FindAllString(ms, -1)); n != 1 {
+		t.Fatalf("bank card should be one placeholder: %s", ms)
+	}
+	restored := string(restore(masked, m))
+	if restored != text {
+		t.Fatalf("roundtrip mismatch:\n got: %s\nwant: %s", restored, text)
+	}
+}
