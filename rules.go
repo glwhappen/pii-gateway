@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 )
 
 // Rule 一条脱敏正则规则。
 type Rule struct {
 	Name    string         `json:"name"`
+	Type    string         `json:"type,omitempty"` // 占位符类型标签，如 PHONE/IDCARD；空则按 UNKNOWN
 	Pattern string         `json:"pattern"`
 	Sample  string         `json:"sample,omitempty"`
 	re      *regexp.Regexp // 不序列化
@@ -30,13 +32,13 @@ var rulesFile = envOr("PII_RULES_FILE", "rules.json")
 func defaultRules() []Rule {
 	return []Rule{
 		// 银行卡放最前（BIN 前缀，避免 19 位卡被身份证规则截断）
-		{Name: "银行卡号", Pattern: `(?:62\d{14,17}|4\d{15}|5[1-5]\d{14})`, Sample: "6222021234567890123"},
-		{Name: "中国大陆身份证", Pattern: `(?i)[0-9]{17}[0-9X]`, Sample: "110101199003071234"},
-		{Name: "中国大陆手机号", Pattern: `1[3-9][0-9]{9}`, Sample: "13812345678"},
-		{Name: "邮箱", Pattern: `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`, Sample: "abc@test.com"},
-		{Name: "中国大陆车牌", Pattern: `[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领][A-HJ-NP-Z][A-HJ-NP-Z0-9]{5,6}`, Sample: "粤B12345"},
-		{Name: "固定电话", Pattern: `0\d{2,3}-?\d{7,8}`, Sample: "0755-12345678"},
-		{Name: "中国护照", Pattern: `(?i)[eghpsd]\d{8}`, Sample: "E12345678"},
+		{Name: "银行卡号", Type: "BANKCARD", Pattern: `(?:62\d{14,17}|4\d{15}|5[1-5]\d{14})`, Sample: "6222021234567890123"},
+		{Name: "中国大陆身份证", Type: "IDCARD", Pattern: `(?i)[0-9]{17}[0-9X]`, Sample: "110101199003071234"},
+		{Name: "中国大陆手机号", Type: "PHONE", Pattern: `1[3-9][0-9]{9}`, Sample: "13812345678"},
+		{Name: "邮箱", Type: "EMAIL", Pattern: `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`, Sample: "abc@test.com"},
+		{Name: "中国大陆车牌", Type: "PLATE", Pattern: `[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领][A-HJ-NP-Z][A-HJ-NP-Z0-9]{5,6}`, Sample: "粤B12345"},
+		{Name: "固定电话", Type: "LANDLINE", Pattern: `0\d{2,3}-?\d{7,8}`, Sample: "0755-12345678"},
+		{Name: "中国护照", Type: "PASSPORT", Pattern: `(?i)[eghpsd]\d{8}`, Sample: "E12345678"},
 	}
 }
 
@@ -44,6 +46,28 @@ func newRuleStore() *ruleStore {
 	s := &ruleStore{rules: defaultRules()}
 	_ = s.compile()
 	return s
+}
+
+// fillDefaultTypes 给 Type 为空的规则补默认类型标签（按名称匹配 defaultRules，否则 UNKNOWN）。
+// 兼容旧版 rules.json（没有 type 字段）。
+func (s *ruleStore) fillDefaultTypes() {
+	def := map[string]string{}
+	for _, r := range defaultRules() {
+		if r.Type != "" {
+			def[r.Name] = r.Type
+		}
+	}
+	s.mu.Lock()
+	for i := range s.rules {
+		if strings.TrimSpace(s.rules[i].Type) == "" {
+			if t, ok := def[s.rules[i].Name]; ok {
+				s.rules[i].Type = t
+			} else {
+				s.rules[i].Type = TypeUnknown
+			}
+		}
+	}
+	s.mu.Unlock()
 }
 
 func (s *ruleStore) compile() error {
@@ -68,11 +92,15 @@ func (s *ruleStore) all() []Rule {
 	return out
 }
 
-// add 添加规则，校验正则合法性。
-func (s *ruleStore) add(name, pattern, sample string) error {
+// add 添加规则，校验正则合法性。typ 为占位符类型标签（如 PHONE/IDCARD），空则 UNKNOWN。
+func (s *ruleStore) add(name, pattern, sample, typ string) error {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return fmt.Errorf("正则不合法: %v", err)
+	}
+	t := strings.ToUpper(strings.TrimSpace(typ))
+	if t == "" {
+		t = TypeUnknown
 	}
 	s.mu.Lock()
 	for i := range s.rules {
@@ -81,8 +109,57 @@ func (s *ruleStore) add(name, pattern, sample string) error {
 			return fmt.Errorf("规则 %q 已存在", name)
 		}
 	}
-	s.rules = append(s.rules, Rule{Name: name, Pattern: pattern, Sample: sample, re: re})
+	if strings.TrimSpace(name) == "" {
+		s.mu.Unlock()
+		return fmt.Errorf("规则名为空")
+	}
+	s.rules = append(s.rules, Rule{Name: name, Type: t, Pattern: pattern, Sample: sample, re: re})
 	s.mu.Unlock()
+	return s.save()
+}
+
+// update 按名称更新规则（可选改名 + 正则 + 示例 + 类型标签），并重新编译。
+// newName 为空表示保持原名；若改名则校验新名不与其它规则冲突。
+// typ 为空表示保持原类型标签；非空则更新占位符类型标签。
+func (s *ruleStore) update(name, newName, pattern, sample, typ string) error {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return fmt.Errorf("正则不合法: %v", err)
+	}
+	// 注意：sync.RWMutex 不可重入，持写锁时不能调用需要读锁的 save()，
+	// 必须先释放写锁再落盘，否则死锁（读锁请求会阻塞在未释放的写锁上）。
+	final := strings.TrimSpace(newName)
+	if final == "" {
+		final = name
+	}
+	s.mu.Lock()
+	found := false
+	// 改名冲突检查：目标名若被其它规则占用则拒绝（改名前后同名允许）。
+	if final != name {
+		for i := range s.rules {
+			if s.rules[i].Name == final {
+				s.mu.Unlock()
+				return fmt.Errorf("规则 %q 已存在", final)
+			}
+		}
+	}
+	for i := range s.rules {
+		if s.rules[i].Name == name {
+			s.rules[i].Name = final
+			s.rules[i].Pattern = pattern
+			s.rules[i].Sample = sample
+			s.rules[i].re = re
+			if t := strings.ToUpper(strings.TrimSpace(typ)); t != "" {
+				s.rules[i].Type = t
+			}
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return fmt.Errorf("规则 %q 不存在", name)
+	}
 	return s.save()
 }
 
@@ -127,6 +204,7 @@ func (s *ruleStore) load() error {
 			s.mu.Lock()
 			s.rules = raw.Rules
 			s.mu.Unlock()
+			s.fillDefaultTypes() // 旧规则文件无 type 字段，这里补默认类型
 		}
 	}
 	if err := s.compile(); err != nil {

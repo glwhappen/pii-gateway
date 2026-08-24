@@ -3,12 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -75,14 +75,14 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		})
 	}()
 
-	// 1. 读请求体并脱敏
+	// 1. 读请求体并脱敏（脱敏前先注入提醒模型保留占位符的 system 说明）
 	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {
 		status = http.StatusBadRequest
 		http.Error(w, "read body: "+err.Error(), status)
 		return
 	}
-	masked := mask(rawBody, m)
+	masked := mask(injectSystemHint(rawBody), m)
 
 	// 2. 重建请求转发到 new-api
 	proxyReq, err := http.NewRequest(r.Method, appCfg.Target()+r.URL.String(), bytes.NewReader(masked))
@@ -185,11 +185,6 @@ func restoreStream(w http.ResponseWriter, r *http.Request, resp *http.Response, 
 	return resp.StatusCode
 }
 
-// danglingPrefixRe 匹配「未闭合的占位符前缀」的任意演进状态。
-// 允许从单个 [ 开始，因为 [[ 本身都可能被拆成两个 token：
-// [  [[  [[P  [[PI  [[PID  [[PID_  [[PID_123  [[PID_123]
-var danglingPrefixRe = regexp.MustCompile(`^\[(?:\[(?:PID_[0-9]*\]?|PID|PI|P)?)?$`)
-
 // restoreDataLine 还原一个 data 行。模型按 token 流式输出，占位符可能被拆到
 // 相邻两个 data 行的 content 字段里，所以按 content 值做跨行拼接还原。
 // 返回 (还原后的 data 行, 本行 content 遗留的未闭合前缀)。
@@ -227,7 +222,7 @@ func restoreContent(value string, m *mapping, carry string) (string, string) {
 // 匹配不上，所以遍历所有 [ 位置取最早能完整匹配前缀的（即最长 tail）。
 func splitDangling(s string) (head, tail string) {
 	for i := 0; i < len(s); i++ {
-		if s[i] == '[' && danglingPrefixRe.MatchString(s[i:]) {
+		if isDanglingPrefix(s[i:]) {
 			return s[:i], s[i:]
 		}
 	}
@@ -269,4 +264,44 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// injectSystemHint 在 OpenAI 风格 chat 请求体的 messages 数组开头注入一条 system 说明，
+// 提醒模型严格保留 <<PII:...>> 占位符，降低还原失败率。
+// 仅当：systemHint 非空 且 body 是含 messages 数组的 JSON 时才注入；否则原样返回。
+// 用 json.RawMessage 保留 messages 之外的顶层字段字节不变（避免重序列化引入精度/顺序问题）。
+func injectSystemHint(body []byte) []byte {
+	if !systemHintEnabled { // 开关默认关闭；关闭时即使有文字也不注入，但文字保留以便后续打开
+		return body
+	}
+	s := strings.TrimSpace(string(systemHint))
+	if s == "" {
+		return body
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body // 非 JSON（如非 chat 接口），不注入
+	}
+	rawMsgs, ok := obj["messages"]
+	if !ok {
+		return body
+	}
+	var msgs []json.RawMessage
+	if err := json.Unmarshal(rawMsgs, &msgs); err != nil {
+		return body
+	}
+	hint, _ := json.Marshal(map[string]string{"role": "system", "content": s})
+	newMsgs := make([]json.RawMessage, 0, len(msgs)+1)
+	newMsgs = append(newMsgs, hint)
+	newMsgs = append(newMsgs, msgs...)
+	out, err := json.Marshal(newMsgs)
+	if err != nil {
+		return body
+	}
+	obj["messages"] = out
+	final, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return final
 }

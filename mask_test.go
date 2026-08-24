@@ -1,7 +1,6 @@
 package main
 
 import (
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -19,7 +18,7 @@ func TestMaskAndRestore(t *testing.T) {
 		}
 	}
 	// 应有占位符
-	if !strings.Contains(string(masked), "[[PID_") {
+	if !strings.Contains(string(masked), "<<PII:") {
 		t.Fatalf("no placeholder produced: %s", masked)
 	}
 
@@ -31,7 +30,7 @@ func TestMaskAndRestore(t *testing.T) {
 		}
 	}
 	// 还原后不应残留占位符
-	if strings.Contains(string(restored), "[[PID_") {
+	if strings.Contains(string(restored), "<<PII:") {
 		t.Fatalf("placeholder leaked after restore: %s", restored)
 	}
 	if string(restored) != string(body) {
@@ -46,7 +45,7 @@ func TestMaskStripsHeaderPseudonymButKeepsJSON(t *testing.T) {
 	m := newMapping()
 	masked := mask([]byte(body), m)
 	s := string(masked)
-	if !strings.HasPrefix(s, `{"user":"[[PID_`) {
+	if !strings.HasPrefix(s, `{"user":"<<PII:`) {
 		t.Fatalf("JSON structure broken: %s", s)
 	}
 	restored := restore([]byte(s), m)
@@ -113,7 +112,7 @@ func TestPersistAndManualAdd(t *testing.T) {
 		t.Fatalf("1111 should not exist yet")
 	}
 	n := pidCounter.Add(1)
-	ph = "[[PID_" + strconv.FormatUint(n, 10) + "]]"
+	ph = phFor(TypeUnknown, n)
 	globalStore.remember("1111", ph)
 	if err := globalStore.saveFile(storeFile); err != nil {
 		t.Fatal(err)
@@ -153,33 +152,37 @@ func TestRestoreStreamLine(t *testing.T) {
 	if !strings.Contains(string(out), "13812345678") {
 		t.Fatalf("stream line not restored: %s", out)
 	}
-	if strings.Contains(string(out), "[[PID_") {
+	if strings.Contains(string(out), "<<PII:") {
 		t.Fatalf("stream line leaked placeholder: %s", out)
 	}
 }
 
-// 占位符可能被拆在任何位置（[[PID_ 锚点本身都可能被拆断），
+// 占位符可能被拆在任何位置（<<PII: 锚点本身都可能被拆断），
 // 且流式下每个 data 行的 content 是独立 token，restoreContent 必须跨 content 拼接还原。
 func TestRestoreLineSplitPlaceholder(t *testing.T) {
+	const (
+		ph1 = "<<PII:PHONE:1>>"
+		ph2 = "<<PII:PHONE:2>>"
+	)
 	cases := []struct {
 		name   string
 		chunks []string // 按行拆分的 content 值片段
 	}{
-		{"无拆分", []string{"[[PID_1]]", "再来"}},
-		{"拆在[[PID_", []string{"[[PID_", "1]]", "再来"}},
-		{"拆在[[PI", []string{"[[PI", "D_1]]", "再来"}},
-		{"拆在[[", []string{"[[", "PID_1]]", "再来"}},
-		{"单字符逐字拆", []string{"[", "[", "P", "I", "D", "_", "1", "]", "]", "再来"}},
-		{"拆在数字中", []string{"[[PID_1", "]]", "再来"}},
-		{"拆在闭合括号", []string{"[[PID_1", "]", "]", "再来"}},
-		{"多占位符+尾部未闭合", []string{"甲[[PID_1]]乙[[PI", "D_2]]丙"}},
+		{"无拆分", []string{ph1, "再来"}},
+		{"拆在<<PII:", []string{"<<PII:", "PHONE:1>>", "再来"}},
+		{"拆在<<PI", []string{"<<PI", "I:PHONE:1>>", "再来"}},
+		{"拆在<<", []string{"<<", "PII:PHONE:1>>", "再来"}},
+		{"单字符逐字拆", []string{"<", "<", "P", "I", "I", ":", "P", "H", "O", "N", "E", ":", "1", ">", ">", "再来"}},
+		{"拆在数字中", []string{"<<PII:PHONE:", "1>>", "再来"}},
+		{"拆在闭合括号", []string{"<<PII:PHONE:1", ">", ">", "再来"}},
+		{"多占位符+尾部未闭合", []string{"甲" + ph1 + "乙<<PII:PHONE:", "2>>丙"}},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newMapping()
-			m.real["[[PID_1]]"] = "13811112222"
-			m.real["[[PID_2]]"] = "13933334444"
+			m.real[ph1] = "13811112222"
+			m.real[ph2] = "13933334444"
 
 			var carry string
 			var sb strings.Builder
@@ -196,7 +199,7 @@ func TestRestoreLineSplitPlaceholder(t *testing.T) {
 			if !strings.Contains(got, "13811112222") {
 				t.Fatalf("PID_1 not restored: %q", got)
 			}
-			if strings.Contains(got, "[[PID_") {
+			if strings.Contains(got, "<<PII:") {
 				t.Fatalf("placeholder leaked: %q", got)
 			}
 			if !strings.Contains(got, "再来") && strings.Contains(tc.chunks[len(tc.chunks)-1], "再来") {
@@ -208,12 +211,37 @@ func TestRestoreLineSplitPlaceholder(t *testing.T) {
 
 // 验证 findClosingQuote 能跳过转义引号，正确取出 content 值。
 func TestFindClosingQuote(t *testing.T) {
-	s := `"content":"他说\"好\"，电话[[PID_1]]"}}]`
+	s := `"content":"他说\"好\"，电话<<PII:PHONE:1>>"}}]`
 	i := strings.Index(s, `"content":"`) + len(`"content":"`)
 	e := findClosingQuote(s, i)
 	got := s[i:e]
-	want := `他说\"好\"，电话[[PID_1]]`
+	want := `他说\"好\"，电话<<PII:PHONE:1>>`
 	if got != want {
 		t.Fatalf("findClosingQuote got %q want %q", got, want)
+	}
+}
+
+func TestMapEncryptDecrypt(t *testing.T) {
+	// 明文真实值经加密后，密文里不应再包含明文子串
+	plain := "13812345678-张三"
+	enc, err := mapEncrypt(plain)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if strings.Contains(enc, plain) || strings.Contains(enc, "13812345678") {
+		t.Fatalf("plaintext leaked into ciphertext: %s", enc)
+	}
+	// 往返一致
+	dec, err := mapDecrypt(enc)
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if dec != plain {
+		t.Fatalf("round-trip mismatch: got %q want %q", dec, plain)
+	}
+	// 篡改密文应解密失败
+	bad := enc[:len(enc)-1] + (func() string { if enc[len(enc)-1] == 'A' { return "B" }; return "A" })()
+	if _, err := mapDecrypt(bad); err == nil {
+		t.Fatalf("expected error for tampered ciphertext")
 	}
 }

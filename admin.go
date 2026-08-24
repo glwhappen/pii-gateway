@@ -1,12 +1,16 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -86,6 +90,7 @@ func startAdmin() {
 	mux.HandleFunc("/api/health", adminHealth)
 	mux.HandleFunc("/api/logs", adminLogs)
 	mux.HandleFunc("/api/rules", adminRules)
+	mux.HandleFunc("/api/rules/update", adminRuleUpdate)
 	mux.HandleFunc("/api/rules/remove", adminRuleRemove)
 	mux.HandleFunc("/api/config", adminConfig)
 	mux.HandleFunc("/api/mappings", adminMappings)
@@ -119,11 +124,16 @@ func adminConfig(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		c := appCfg.Get()
 		writeJSON(w, map[string]any{
-			"forward_target": c.ForwardTarget,
-			"listen_addr":    c.ListenAddr,
-			"admin_addr":     c.AdminAddr,
-			"store_file":     c.StoreFile,
-			"rules_file":     c.RulesFile,
+			"forward_target":     c.ForwardTarget,
+			"listen_addr":        c.ListenAddr,
+			"admin_addr":         c.AdminAddr,
+			"store_file":         c.StoreFile,
+			"rules_file":         c.RulesFile,
+			"placeholder_prefix": c.PlaceholderPrefix,
+			"placeholder_sep":    c.PlaceholderSep,
+			"placeholder_suffix":  c.PlaceholderSuffix,
+			"system_hint":         c.SystemHint,
+			"system_hint_enabled": c.SystemHintEnabled,
 		})
 	case http.MethodPost:
 		adminConfigSet(w, r)
@@ -135,9 +145,14 @@ func adminConfig(w http.ResponseWriter, r *http.Request) {
 // adminConfigSet 设置转发目标（热生效）；端口/文件类改动保存但需重启。
 func adminConfigSet(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ForwardTarget string `json:"forward_target"`
-		ListenAddr    string `json:"listen_addr"`
-		AdminAddr     string `json:"admin_addr"`
+		ForwardTarget     string `json:"forward_target"`
+		ListenAddr        string `json:"listen_addr"`
+		AdminAddr         string `json:"admin_addr"`
+		PlaceholderPrefix string `json:"placeholder_prefix"`
+		PlaceholderSep    string `json:"placeholder_sep"`
+		PlaceholderSuffix string `json:"placeholder_suffix"`
+		SystemHint        string `json:"system_hint"`
+		SystemHintEnabled string `json:"system_hint_enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
@@ -156,6 +171,25 @@ func adminConfigSet(w http.ResponseWriter, r *http.Request) {
 		c.AdminAddr = a
 		restart = true
 	}
+	if p := strings.TrimSpace(req.PlaceholderPrefix); p != "" && p != c.PlaceholderPrefix {
+		c.PlaceholderPrefix = p
+		restart = true
+	}
+	if req.PlaceholderSep != "" && req.PlaceholderSep != c.PlaceholderSep {
+		c.PlaceholderSep = req.PlaceholderSep
+		restart = true
+	}
+	if req.PlaceholderSuffix != "" && req.PlaceholderSuffix != c.PlaceholderSuffix {
+		c.PlaceholderSuffix = req.PlaceholderSuffix
+		restart = true
+	}
+	if req.SystemHint != "" && req.SystemHint != c.SystemHint {
+		c.SystemHint = req.SystemHint
+	}
+	if req.SystemHintEnabled != "" && req.SystemHintEnabled != c.SystemHintEnabled {
+		c.SystemHintEnabled = req.SystemHintEnabled
+	}
+	// 提示说明与开关随配置热生效，无需重启
 	if err := appCfg.Save(c); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -169,7 +203,7 @@ func adminRules(w http.ResponseWriter, r *http.Request) {
 		rules := globalRules.all()
 		out := make([]map[string]string, 0, len(rules))
 		for _, rl := range rules {
-			out = append(out, map[string]string{"name": rl.Name, "pattern": rl.Pattern, "sample": rl.Sample})
+			out = append(out, map[string]string{"name": rl.Name, "type": rl.Type, "pattern": rl.Pattern, "sample": rl.Sample})
 		}
 		writeJSON(w, map[string]any{"rules": out})
 	case http.MethodPost:
@@ -179,10 +213,16 @@ func adminRules(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// adminRuleAdd 手动添加一条正则规则。
-func adminRuleAdd(w http.ResponseWriter, r *http.Request) {
+// adminRuleUpdate 更新已有正则规则（名称不变，改正则/示例）。
+func adminRuleUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
-		Name    string `json:"name"`
+		Name    string `json:"name"`    // 当前规则名（定位用）
+		NewName string `json:"new_name"` // 新规则名（可为空 = 不变）
+		Type    string `json:"type"`    // 占位符类型标签，可为空 = 不变
 		Pattern string `json:"pattern"`
 		Sample  string `json:"sample"`
 	}
@@ -196,7 +236,33 @@ func adminRuleAdd(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name and pattern are required", http.StatusBadRequest)
 		return
 	}
-	if err := globalRules.add(name, pattern, req.Sample); err != nil {
+	newName := strings.TrimSpace(req.NewName)
+	if err := globalRules.update(name, newName, pattern, req.Sample, req.Type); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "name": newName})
+}
+
+// adminRuleAdd 手动添加一条正则规则。
+func adminRuleAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name    string `json:"name"`
+		Type    string `json:"type"` // 占位符类型标签，空则 UNKNOWN
+		Pattern string `json:"pattern"`
+		Sample  string `json:"sample"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	pattern := strings.TrimSpace(req.Pattern)
+	if name == "" || pattern == "" {
+		http.Error(w, "name and pattern are required", http.StatusBadRequest)
+		return
+	}
+	if err := globalRules.add(name, pattern, req.Sample, req.Type); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -225,9 +291,18 @@ func adminRuleRemove(w http.ResponseWriter, r *http.Request) {
 func adminMappings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		entries := globalStore.list()
+		encEntries := make([]map[string]string, 0, len(entries))
+		for _, e := range entries {
+			er, err := mapEncrypt(e.Real)
+			if err != nil {
+				er = e.Real // 加密失败回退明文（理论上不会发生）
+			}
+			encEntries = append(encEntries, map[string]string{"placeholder": e.Placeholder, "real": er})
+		}
 		writeJSON(w, map[string]any{
 			"size":    globalStore.size(),
-			"entries": globalStore.list(),
+			"entries": encEntries,
 		})
 	case http.MethodPost:
 		adminMappingsAdd(w, r)
@@ -245,23 +320,28 @@ func adminMappingsAdd(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	real := strings.TrimSpace(req.Real)
-	if real == "" {
+	// req.Real 由浏览器加密后发送，这里先解密为明文再处理（脱敏引擎需要明文）。
+	plain := strings.TrimSpace(req.Real)
+	if dec, err := mapDecrypt(plain); err == nil && dec != "" {
+		plain = strings.TrimSpace(dec)
+	}
+	if plain == "" {
 		http.Error(w, "real is required", http.StatusBadRequest)
 		return
 	}
+	enc, _ := mapEncrypt(plain)
 	// 已存在则直接返回现有占位符
-	if ph, ok := globalStore.lookup(real); ok {
-		writeJSON(w, map[string]any{"placeholder": ph, "real": real, "new": false})
+	if ph, ok := globalStore.lookup(plain); ok {
+		writeJSON(w, map[string]any{"placeholder": ph, "real": enc, "new": false})
 		return
 	}
 	n := pidCounter.Add(1)
-	ph := "[[PID_" + strconv.FormatUint(n, 10) + "]]"
-	globalStore.remember(real, ph)
+	ph := phFor(TypeUnknown, n)
+	globalStore.remember(plain, ph)
 	if err := globalStore.saveFile(piiStoreFile); err != nil {
 		log.Printf("save pii store: %v", err)
 	}
-	writeJSON(w, map[string]any{"placeholder": ph, "real": real, "new": true})
+	writeJSON(w, map[string]any{"placeholder": ph, "real": enc, "new": true})
 }
 
 func adminMappingsClear(w http.ResponseWriter, r *http.Request) {
@@ -302,6 +382,67 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 // ---------------------------------------------------------------------------
+// 映射表真实值传输加密（AES-256-GCM，浏览器 <-> 后端）
+// ---------------------------------------------------------------------------
+//
+// 目的：映射表里真实值是敏感 PII，避免在浏览器<->后端的请求/响应里以明文传输
+// （被抓包、代理、日志记录看到）。浏览器用同一密钥加密发送、解密显示。
+//
+// 注意：这是“混淆级”加密——密钥硬编码在前端 JS 与后端，攻击者可读前端源码拿到
+// 密钥，因此只能防“无心”的抓包/明文日志，不能防定向攻击。
+// 脱敏/还原引擎需要明文真实值做子串匹配，所以后端内部存储与 store.json 落盘
+// 仍为明文，加密只作用于 API 传输边界。
+
+var mapSecretKey = []byte("pii-gateway-map-secret-2026")
+
+func mapAesGCM() (cipher.AEAD, error) {
+	sum := sha256.Sum256(mapSecretKey) // 32 字节 -> AES-256 密钥，与前端 SHA-256 派生一致
+	block, err := aes.NewCipher(sum[:])
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+// mapEncrypt 加密明文真实值，返回 base64(iv || ciphertext)。
+func mapEncrypt(plain string) (string, error) {
+	gcm, err := mapAesGCM()
+	if err != nil {
+		return "", err
+	}
+	iv := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(iv); err != nil {
+		return "", err
+	}
+	ct := gcm.Seal(nil, iv, []byte(plain), nil)
+	out := make([]byte, 0, len(iv)+len(ct))
+	out = append(out, iv...)
+	out = append(out, ct...)
+	return base64.StdEncoding.EncodeToString(out), nil
+}
+
+// mapDecrypt 解密 base64(iv || ciphertext) 得到明文。
+func mapDecrypt(enc string) (string, error) {
+	gcm, err := mapAesGCM()
+	if err != nil {
+		return "", err
+	}
+	raw, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil {
+		return "", err
+	}
+	if len(raw) < gcm.NonceSize() {
+		return "", fmt.Errorf("ciphertext too short")
+	}
+	iv, ct := raw[:gcm.NonceSize()], raw[gcm.NonceSize():]
+	pt, err := gcm.Open(nil, iv, ct, nil)
+	if err != nil {
+		return "", err
+	}
+	return string(pt), nil
+}
+
+// ---------------------------------------------------------------------------
 // 管理页面（内嵌 HTML）
 // ---------------------------------------------------------------------------
 
@@ -312,37 +453,75 @@ const adminPageHTML = `<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PII 脱敏网关</title>
 <style>
-:root{--bg:#0f1117;--card:#181b25;--line:#262a38;--fg:#e6e8ee;--muted:#8b90a0;--ok:#34d399;--warn:#fbbf24;--err:#f87171;--accent:#6366f1}
-body.theme-light{--bg:#f6f8fb;--card:#ffffff;--line:#e5e8ee;--fg:#1f2430;--muted:#68707f;--ok:#059669;--warn:#b45309;--err:#dc2626;--accent:#4f46e5}
-*{box-sizing:border-box}body{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);color:var(--fg);font-size:14px}
-.wrap{max-width:1100px;margin:0 auto;padding:24px}
-h1{font-size:20px;margin:0 0 4px}.sub{color:var(--muted);margin-bottom:20px}
-.top{display:flex;justify-content:space-between;align-items:flex-start}
-.theme-btn{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer;font-size:13px}
-.theme-btn:hover{opacity:.85}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:20px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
-.card .k{color:var(--muted);font-size:12px;margin-bottom:6px}.card .v{font-size:18px}
-.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;margin:2px}
-.pill.ok{background:rgba(52,211,153,.15);color:var(--ok);border:1px solid rgba(52,211,153,.4)}
-.pill.bad{background:rgba(248,113,113,.15);color:var(--err);border:1px solid rgba(248,113,113,.4)}
-.pill.line{background:rgba(99,102,241,.15);color:var(--accent);border:1px solid rgba(99,102,241,.4)}
-h2{font-size:15px;margin:0 0 12px}
-.panel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:20px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top;white-space:nowrap}
-th{color:var(--muted);font-weight:normal}
-tr:hover td{background:rgba(255,255,255,.02)}
-.err{color:var(--err)}.okc{color:var(--ok)}
-textarea{width:100%;min-height:70px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:10px;font-family:inherit;resize:vertical}
-.inp{flex:1;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-family:inherit}
-button{background:var(--accent);border:none;color:#fff;padding:8px 16px;border-radius:8px;cursor:pointer;font-size:14px}
-button:hover{opacity:.9}
-.pair{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
-.pair .lbl{color:var(--muted);font-size:12px;margin-bottom:4px}
-.out{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;min-height:36px;word-break:break-all;white-space:pre-wrap}
+:root{
+  --bg:#f7f8fa;--surface:#ffffff;--card:#ffffff;--line:#e4e7ec;--line-strong:#d0d5dd;
+  --fg:#101828;--fg-secondary:#344054;--muted:#667085;
+  --ok:#027a48;--ok-bg:#ecfdf3;--warn:#b54708;--warn-bg:#fffaeb;--err:#b42318;--err-bg:#fef3f2;
+  --accent:#4f46e5;--accent-hover:#4338ca;--accent-bg:#eef4ff;
+  --shadow:0 1px 3px rgba(16,24,40,.08),0 1px 2px rgba(16,24,40,.04);
+  --shadow-md:0 4px 8px -2px rgba(16,24,40,.08),0 2px 4px -2px rgba(16,24,40,.04);
+  --overlay:rgba(15,17,23,.45);
+  --radius:10px;--radius-sm:8px;
+}
+body.theme-dark{
+  --bg:#0f1117;--surface:#131620;--card:#181b25;--line:#262a38;--line-strong:#2f3447;
+  --fg:#f2f4f7;--fg-secondary:#e4e7ec;--muted:#8b90a0;
+  --ok:#34d399;--ok-bg:rgba(52,211,153,.12);--warn:#fbbf24;--warn-bg:rgba(251,191,36,.12);--err:#f87171;--err-bg:rgba(248,113,113,.12);
+  --accent:#818cf8;--accent-hover:#a5b4fc;--accent-bg:rgba(99,102,241,.15);
+  --shadow:0 1px 3px rgba(0,0,0,.35);--shadow-md:0 4px 8px rgba(0,0,0,.4);
+  --overlay:rgba(0,0,0,.65);
+}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans',sans-serif,'Apple Color Emoji','Segoe UI Emoji';background:var(--bg);color:var(--fg);font-size:14px;line-height:1.5}
+.wrap{max-width:1120px;margin:0 auto;padding:28px 24px}
+h1{font-size:22px;font-weight:600;margin:0 0 4px;letter-spacing:-.2px}
+.sub{color:var(--muted);font-size:13px;margin-bottom:22px}
+.top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
+.theme-btn{background:var(--card);color:var(--fg-secondary);border:1px solid var(--line);border-radius:var(--radius-sm);padding:7px 14px;cursor:pointer;font-size:13px;font-weight:500;box-shadow:var(--shadow);transition:all .15s ease}
+.theme-btn:hover{border-color:var(--line-strong);background:var(--surface);transform:translateY(-1px)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:24px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow);transition:transform .15s ease,box-shadow .15s ease}
+.card:hover{transform:translateY(-1px);box-shadow:var(--shadow-md)}
+.card .k{color:var(--muted);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
+.card .v{font-size:20px;font-weight:600;color:var(--fg);line-height:1.3}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500}
+.pill.ok{background:var(--ok-bg);color:var(--ok);border:1px solid color-mix(in srgb,var(--ok) 22%,transparent)}
+.pill.warn{background:var(--warn-bg);color:var(--warn);border:1px solid color-mix(in srgb,var(--warn) 22%,transparent)}
+.pill.bad{background:var(--err-bg);color:var(--err);border:1px solid color-mix(in srgb,var(--err) 22%,transparent)}
+.pill.line{background:var(--accent-bg);color:var(--accent);border:1px solid color-mix(in srgb,var(--accent) 22%,transparent)}
+h2{font-size:15px;font-weight:600;margin:0 0 14px;color:var(--fg)}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px;margin-bottom:22px;box-shadow:var(--shadow)}
+table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top;white-space:nowrap}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px;background:var(--bg)}
+thead tr:first-child th{border-top:1px solid var(--line)}
+thead th:first-child{border-radius:var(--radius-sm) 0 0 0}
+thead th:last-child{border-radius:0 var(--radius-sm) 0 0}
+tr:hover td{background:var(--bg)}
+.err{color:var(--err)}.okc{color:var(--ok)}.warn{color:var(--warn)}
+textarea{width:100%;min-height:84px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:var(--radius-sm);padding:10px 12px;font-family:inherit;font-size:13px;line-height:1.5;resize:vertical;transition:border-color .15s,box-shadow .15s}
+textarea:focus,.inp:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
+.inp{flex:1;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:var(--radius-sm);padding:8px 12px;font-family:inherit;font-size:13px;transition:border-color .15s,box-shadow .15s}
+button{background:var(--accent);border:none;color:#fff;padding:8px 16px;border-radius:var(--radius-sm);cursor:pointer;font-size:13px;font-weight:500;transition:background .15s,transform .1s,box-shadow .15s}
+button:hover{background:var(--accent-hover);box-shadow:var(--shadow-md)}
+button:active{transform:translateY(1px)}
+button.secondary{background:var(--bg);color:var(--fg-secondary);border:1px solid var(--line)}
+button.secondary:hover{background:var(--surface);border-color:var(--line-strong)}
+button.danger{background:var(--err-bg);color:var(--err);border:1px solid color-mix(in srgb,var(--err) 22%,transparent)}
+button.danger:hover{background:var(--err-bg);filter:brightness(.97)}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+.pair .lbl{color:var(--muted);font-size:12px;font-weight:500;margin-bottom:6px}
+.out{background:var(--bg);border:1px solid var(--line);border-radius:var(--radius-sm);padding:12px;min-height:44px;word-break:break-all;white-space:pre-wrap;font-size:13px;line-height:1.5;color:var(--fg-secondary)}
 .muted{color:var(--muted)}.mb{margin-bottom:8px}
-a{color:var(--accent)}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.empty-row td{color:var(--muted);text-align:center;padding:18px 12px}
+@media (max-width:640px){
+  .wrap{padding:18px 16px}
+  .pair{grid-template-columns:1fr}
+  .top{flex-direction:column;gap:12px}
+  h1{font-size:20px}
+}
 </style>
 </head>
 <body>
@@ -352,7 +531,7 @@ a{color:var(--accent)}
       <h1>🔐 PII 脱敏网关</h1>
       <div class="sub">在 LLM 网关前自动脱敏手机号/身份证，响应自动还原 · 管理端口 <span id="adminAddr">—</span></div>
     </div>
-    <button class="theme-btn" id="themeBtn" onclick="toggleTheme()">🌙 深色</button>
+    <button class="theme-btn" id="themeBtn" onclick="toggleTheme()">☀️ 浅色</button>
   </div>
 
   <div class="grid" id="stats"></div>
@@ -370,6 +549,21 @@ a{color:var(--accent)}
       <span class="muted" style="margin-left:12px">管理端口</span>
       <input id="cfgAdmin" class="inp" style="width:120px">
     </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
+      <span class="muted" style="min-width:70px">占位符格式</span>
+      <input id="cfgPhPrefix" class="inp" style="width:84px" placeholder="前缀">
+      <input id="cfgPhSep" class="inp" style="width:56px" placeholder="分隔">
+      <input id="cfgPhSuffix" class="inp" style="width:84px" placeholder="后缀">
+      <span class="muted">例：<code>&lt;&lt;PII:PHONE:1&gt;&gt;</code>（改后需重启并清空旧映射）</span>
+    </div>
+    <div style="margin-top:12px">
+      <div class="lbl" style="color:var(--muted);font-size:12px;font-weight:500;margin-bottom:6px">注入给上游模型的说明 <span class="muted">(提醒保留 &lt;&lt;PII:...&gt;&gt; 占位符)</span></div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <input type="checkbox" id="cfgSystemHintEnabled" style="width:16px;height:16px;accent-color:var(--accent)">
+        <label for="cfgSystemHintEnabled" class="muted">启用注入（默认关闭）</label>
+      </div>
+      <textarea id="cfgSystemHint" rows="3" placeholder="请严格原样保留所有形如 &lt;&lt;PII:...&gt;&gt; 的占位符…"></textarea>
+    </div>
     <div class="muted">映射文件 <span id="cfgStore"></span> · 规则文件 <span id="cfgRules"></span></div>
     <div id="cfgMsg" style="margin-top:8px"></div>
   </div>
@@ -385,22 +579,38 @@ a{color:var(--accent)}
   </div>
 
   <div class="panel">
-    <h2>🧩 正则规则 <span class="muted">(脱敏匹配规则，可增删，落盘持久)</span></h2>
+    <h2>🧩 正则规则 <span class="muted">(脱敏匹配规则，可增删改，落盘持久)</span></h2>
     <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
       <input id="ruleName" class="inp" style="flex:1;min-width:140px" placeholder="规则名，如：银行卡号">
+      <input id="ruleType" class="inp" style="width:110px" placeholder="类型，如 PHONE" title="占位符类型标签，如 PHONE/IDCARD/EMAIL，留空则为 UNKNOWN">
       <input id="rulePattern" class="inp" style="flex:2;min-width:220px" placeholder="正则，如：\\d{16,19}" onkeydown="if(event.key==='Enter')addRule()">
       <button onclick="addRule()">➕ 添加规则</button>
     </div>
     <div style="overflow-x:auto"><table>
-      <thead><tr><th>规则名</th><th>正则</th><th>示例</th><th></th></tr></thead>
+      <thead><tr><th>规则名</th><th>类型</th><th>正则</th><th>示例</th><th style="width:120px"></th></tr></thead>
       <tbody id="ruleBody"></tbody>
     </table></div>
     <div class="muted" id="ruleEmpty" style="margin-top:10px">暂无规则</div>
   </div>
 
+  <div id="editModal" style="display:none;position:fixed;inset:0;background:var(--overlay);z-index:100;align-items:center;justify-content:center;padding:20px">
+    <div style="background:var(--card);border:1px solid var(--line);border-radius:var(--radius);width:100%;max-width:560px;box-shadow:var(--shadow-md);padding:22px">
+      <h2 style="margin-bottom:16px">✏️ 编辑规则</h2>
+      <input type="hidden" id="editOrigName">
+      <div class="mb"><div class="lbl">规则名</div><input id="editName" class="inp" placeholder="规则名，如：银行卡号"></div>
+      <div class="mb"><div class="lbl">类型 <span class="muted">(占位符标签，留空保持原值)</span></div><input id="editType" class="inp" placeholder="如 PHONE/IDCARD/EMAIL"></div>
+      <div class="mb"><div class="lbl">正则</div><textarea id="editPattern" rows="4" placeholder="输入正则表达式"></textarea></div>
+      <div class="mb"><div class="lbl">示例</div><input id="editSample" class="inp" placeholder="可选：填写一个匹配示例"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px">
+        <button class="secondary" onclick="closeEditModal()">取消</button>
+        <button onclick="saveRuleEdit()">保存修改</button>
+      </div>
+    </div>
+  </div>
+
   <div class="panel">
     <h2>🗺️ 映射表 <span class="muted">(<span id="mapCount">0</span> 条 · 同一内容跨请求复用同一占位符)</span>
-      <button style="float:right" onclick="clearMappings()">🗑️ 清除全部</button>
+      <button class="danger" style="float:right" onclick="clearMappings()">🗑️ 清除全部</button>
     </h2>
     <div style="display:flex;gap:8px;margin-bottom:12px">
       <input id="newReal" style="flex:1" class="inp" placeholder="手动添加真实值，如 1111 —— 自动分配占位符" onkeydown="if(event.key==='Enter')addMapping()">
@@ -438,7 +648,7 @@ async function refresh(){
       ['映射条目', h.mapping_size],
       ['当前时间', h.now]
     ].map(([k,v])=>'<div class="card"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>').join('');
-  }catch(e){ $$('stats').innerHTML='<div class="card"><div class="k">管理端</div><div class="v err">'+e+'</div></div>'; }
+  }catch(e){ $$('stats').innerHTML='<div class="card"><div class="k">管理端</div><div class="v err">连接失败</div></div>'; }
 
   try{
     const logs = await j('/api/logs');
@@ -447,10 +657,10 @@ async function refresh(){
       const st = l.status>=500?'bad':(l.status>=400?'warn':'ok');
       const cls = l.status>=400?'err':'okc';
       return '<tr><td>'+l.time+'</td><td>'+l.client_ip+'</td><td>'+l.method+'</td><td>'+l.path+'</td>'+
-        '<td class="'+cls+'">'+l.status+'</td><td>'+l.duration_ms+'ms</td>'+
+        '<td class="'+cls+'">'+l.status+'</td><td>'+l.duration_ms+' ms</td>'+
         '<td>'+(l.masked_count||0)+'</td><td>'+(l.restored_count||0)+'</td>'+
         '<td>'+(l.residual?'<span class="pill bad">残留</span>':'—')+'</td></tr>';
-    }).join('') || '<tr><td colspan="9" class="muted">暂无转发日志，等请求经过网关后自动出现。</td></tr>';
+    }).join('') || '<tr class="empty-row"><td colspan="9">暂无转发日志，等请求经过网关后自动出现。</td></tr>';
   }catch(e){}
 }
 
@@ -464,19 +674,64 @@ async function runSelfTest(){
   }catch(e){ $$('maskedOut').textContent='错误: '+e }
 }
 
+function truncate(s, n){
+  if(!s) return '';
+  return s.length > n ? s.slice(0,n)+'…' : s;
+}
 async function loadRules(){
   try{
     const d = await j('/api/rules');
-    $$('ruleBody').innerHTML = d.rules.map(r=>'<tr><td>'+r.name+'</td><td><code>'+r.pattern+'</code></td><td>'+(r.sample||'—')+'</td><td><button style="padding:2px 10px" onclick="removeRule('+JSON.stringify(r.name)+')">删</button></td></tr>').join('');
+    $$('ruleBody').innerHTML = d.rules.map(r=>{
+      const short = truncate(r.pattern, 24);
+      const smp = truncate(r.sample, 18) || '—';
+      return '<tr><td>'+truncate(r.name, 14)+'</td>'+
+        '<td><code>'+escapeHtml(r.type||'UNKNOWN')+'</code></td>'+
+        '<td><code title="'+escapeHtml(r.pattern)+'">'+escapeHtml(short)+'</code></td>'+
+        '<td title="'+escapeHtml(r.sample||'')+'">'+escapeHtml(smp)+'</td>'+
+        '<td><button class="secondary" style="padding:3px 12px;margin-right:6px" onclick="openEditModal('+escapeHtml(JSON.stringify(r))+')">编辑</button>'+
+        '<button class="danger" style="padding:3px 12px" onclick="removeRule('+escapeHtml(JSON.stringify(r.name))+')">删除</button></td></tr>';
+    }).join('');
     $$('ruleEmpty').style.display = d.rules.length? 'none':'block';
   }catch(e){}
 }
+function escapeHtml(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+$$('editModal').addEventListener('click', e=>{ if(e.target===$$('editModal')) closeEditModal(); });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeEditModal(); });
+function openEditModal(r){
+  $$('editOrigName').value = r.name;
+  $$('editName').value = r.name;
+  $$('editType').value = r.type || '';
+  $$('editPattern').value = r.pattern;
+  $$('editSample').value = r.sample || '';
+  $$('editModal').style.display = 'flex';
+  $$('editName').focus();
+}
+function closeEditModal(){
+  $$('editModal').style.display = 'none';
+}
+async function saveRuleEdit(){
+  const name = $$('editOrigName').value;     // 当前名（定位用）
+  const newName = $$('editName').value.trim(); // 新名（可改）
+  const type = $$('editType').value.trim();  // 占位符类型标签（可改，留空保持原值）
+  const pattern = $$('editPattern').value.trim();
+  const sample = $$('editSample').value.trim();
+  if(!newName){ alert('请填写规则名'); return; }
+  if(!pattern){ alert('请填写正则'); return; }
+  try{
+    await j('/api/rules/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,new_name:newName,type,pattern,sample})});
+    closeEditModal(); loadRules();
+  }catch(e){ alert('更新失败: '+e) }
+}
 async function addRule(){
   const name = $$('ruleName').value.trim(), pattern = $$('rulePattern').value.trim();
+  const type = $$('ruleType').value.trim();
   if(!name||!pattern){ alert('请填写规则名和正则'); return; }
   try{
-    await j('/api/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,pattern})});
-    $$('ruleName').value=''; $$('rulePattern').value=''; loadRules();
+    await j('/api/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,type,pattern})});
+    $$('ruleName').value=''; $$('ruleType').value=''; $$('rulePattern').value=''; loadRules();
   }catch(e){ alert('添加失败: '+e) }
 }
 async function removeRule(name){
@@ -484,11 +739,43 @@ async function removeRule(name){
   try{ await j('/api/rules/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}); loadRules(); }
   catch(e){ alert('删除失败: '+e) }
 }
+// ---- 映射表真实值传输加密（AES-256-GCM，与后端共享密钥）----
+const MAP_SECRET = 'pii-gateway-map-secret-2026';
+async function mapKey(){
+  const enc = new TextEncoder();
+  const digest = await crypto.subtle.digest('SHA-256', enc.encode(MAP_SECRET)); // 32字节 = AES-256
+  return crypto.subtle.importKey('raw', digest, {name:'AES-GCM'}, false, ['encrypt','decrypt']);
+}
+async function encReal(plain){
+  const key = await mapKey();
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, new TextEncoder().encode(plain));
+  const buf = new Uint8Array(iv.length + ct.byteLength);
+  buf.set(iv, 0); buf.set(new Uint8Array(ct), iv.length);
+  let bin=''; for(let i=0;i<buf.length;i++) bin += String.fromCharCode(buf[i]);
+  return btoa(bin);
+}
+async function decReal(b64){
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+  const key = await mapKey();
+  const iv = bytes.slice(0,12);
+  const ct = bytes.slice(12);
+  const pt = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, ct);
+  return new TextDecoder().decode(pt);
+}
 async function loadMappings(){
   try{
     const d = await j('/api/mappings');
+    const rows = await Promise.all(d.entries.map(async e=>{
+      let real = e.real;
+      try{ real = await decReal(e.real); }catch(err){}
+      // 占位符 <<PII:...>> 含 < >，必须 HTML 转义，否则被当标签吞掉只剩 <>
+      return '<tr><td>'+escapeHtml(e.placeholder)+'</td><td>'+escapeHtml(real)+'</td></tr>';
+    }));
     $$('mapCount').textContent = d.size;
-    $$('mapBody').innerHTML = d.entries.map(e=>'<tr><td>'+e.placeholder+'</td><td>'+e.real+'</td></tr>').join('');
+    $$('mapBody').innerHTML = rows.join('');
     $$('mapEmpty').style.display = d.size? 'none':'block';
   }catch(e){}
 }
@@ -496,8 +783,9 @@ async function addMapping(){
   const real = $$('newReal').value.trim();
   if(!real){ alert('请输入要添加的真实值'); return; }
   try{
-    const r = await j('/api/mappings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({real})});
-    alert('已'+(r.new?'新增':'复用')+'映射：'+r.real+' → '+r.placeholder);
+    const enc = await encReal(real); // 加密后发送，传输中不为明文
+    const r = await j('/api/mappings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({real:enc})});
+    alert('已'+(r.new?'新增':'复用')+'映射：'+real+' → '+r.placeholder);
     $$('newReal').value='';
     loadMappings();
   }catch(e){ alert('添加失败: '+e) }
@@ -511,11 +799,11 @@ async function clearMappings(){
 }
 
 function applyTheme(t){
-  document.body.classList.toggle('theme-light', t==='light');
+  document.body.classList.toggle('theme-dark', t==='dark');
   localStorage.setItem('pii_theme', t);
-  $$('themeBtn').textContent = t==='light'? '☀️ 浅色' : '🌙 深色';
+  $$('themeBtn').textContent = t==='dark'? '🌙 深色' : '☀️ 浅色';
 }
-function toggleTheme(){ applyTheme(localStorage.getItem('pii_theme')==='light'?'dark':'light'); }
+function toggleTheme(){ applyTheme(localStorage.getItem('pii_theme')==='dark'?'light':'dark'); }
 
 async function loadConfig(){
   try{
@@ -525,13 +813,23 @@ async function loadConfig(){
     $$('cfgAdmin').value = c.admin_addr;
     $$('cfgStore').textContent = c.store_file;
     $$('cfgRules').textContent = c.rules_file;
+    $$('cfgPhPrefix').value = c.placeholder_prefix;
+    $$('cfgPhSep').value = c.placeholder_sep;
+    $$('cfgPhSuffix').value = c.placeholder_suffix;
+    $$('cfgSystemHint').value = c.system_hint || '';
+    $$('cfgSystemHintEnabled').checked = ['on','true','1','yes'].includes(String(c.system_hint_enabled||'').toLowerCase());
   }catch(e){}
 }
 async function saveConfig(){
   const body = {
     forward_target: $$('cfgTarget').value.trim(),
     listen_addr: $$('cfgListen').value.trim(),
-    admin_addr: $$('cfgAdmin').value.trim()
+    admin_addr: $$('cfgAdmin').value.trim(),
+    placeholder_prefix: $$('cfgPhPrefix').value.trim(),
+    placeholder_sep: $$('cfgPhSep').value,
+    placeholder_suffix: $$('cfgPhSuffix').value,
+    system_hint: $$('cfgSystemHint').value,
+    system_hint_enabled: $$('cfgSystemHintEnabled').checked ? 'on':'off'
   };
   try{
     const r = await j('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -543,7 +841,7 @@ async function saveConfig(){
 refresh();
 setInterval(()=>{ refresh(); loadMappings(); loadRules(); loadConfig(); }, 1500);
 loadMappings(); loadRules(); loadConfig();
-applyTheme(localStorage.getItem('pii_theme')||'dark');
+applyTheme(localStorage.getItem('pii_theme')||'light');
 </script>
 </body>
 </html>

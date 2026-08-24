@@ -3,17 +3,11 @@ package main
 import (
 	"encoding/json"
 	"os"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 )
-
-// 占位符格式：[[PID_<n>]]，只用字母数字下划线，不破坏 JSON，
-// 且足够独特，模型正常情况下会原样返回、便于还原。
-var placeholderRe = regexp.MustCompile(`\[\[PID_[0-9]+\]\]`)
 
 var pidCounter atomic.Uint64
 
@@ -133,14 +127,6 @@ func (s *piiStore) clear() {
 	_ = s.saveFile(piiStoreFile)
 }
 
-// phNumber 解析占位符里的编号 [[PID_123]] -> 123。
-func phNumber(ph string) int {
-	s := strings.TrimPrefix(ph, "[[PID_")
-	s = strings.TrimSuffix(s, "]]")
-	n, _ := strconv.Atoi(s)
-	return n
-}
-
 // ResetPIIStore 清空全局映射（供测试或管理面板调用）。
 func ResetPIIStore() {
 	globalStore = newPIIStore()
@@ -170,12 +156,18 @@ func mask(body []byte, m *mapping) []byte {
 		if r.re == nil {
 			continue
 		}
+		typ := r.Type
 		s = r.re.ReplaceAllStringFunc(s, func(x string) string {
-			return maskOne(x, m)
+			return maskOne(x, m, typ)
 		})
 	}
-	// 手动添加的自定义值：body 中出现即替换为其占位符
-	for _, e := range globalStore.manualEntries() {
+	// 手动添加的自定义值：body 中出现即替换为其占位符。
+	// 注意：manualEntries 来自 map 迭代顺序不确定，必须按真实值长度降序排序后再替换，
+	// 否则短值（如 123）可能先替换长值（如 1234）里的子串，把 1234 拆开残留明文。
+	// 长值优先 + ReplaceAll 贪心替换，保证任一被包含的短值不会破坏长值。
+	manual := globalStore.manualEntries()
+	sort.Slice(manual, func(i, j int) bool { return len(manual[i].Real) > len(manual[j].Real) })
+	for _, e := range manual {
 		if strings.Contains(s, e.Real) {
 			s = strings.ReplaceAll(s, e.Real, e.Placeholder)
 			if _, ok := m.real[e.Placeholder]; !ok {
@@ -201,7 +193,7 @@ func (s *piiStore) manualEntries() []mappingEntry {
 	return out
 }
 
-func maskOne(real string, m *mapping) string {
+func maskOne(real string, m *mapping, typ string) string {
 	// 已替换过的占位符不再重复处理
 	if placeholderRe.MatchString(real) {
 		return real
@@ -210,7 +202,7 @@ func maskOne(real string, m *mapping) string {
 	ph, ok := globalStore.lookup(real)
 	if !ok {
 		n := pidCounter.Add(1)
-		ph = "[[PID_" + strconv.FormatUint(n, 10) + "]]"
+		ph = phFor(typ, n)
 		if globalStore.remember(real, ph) {
 			_ = globalStore.saveFile(piiStoreFile) // 新增映射立即落盘
 		}

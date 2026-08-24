@@ -60,7 +60,7 @@ func TestEndToEndStream(t *testing.T) {
 	if !strings.Contains(s, "13812345678") {
 		t.Fatalf("stream not restored, got: %s", s)
 	}
-	if strings.Contains(s, "[[PID_") {
+	if strings.Contains(s, "<<PII:") {
 		t.Fatalf("placeholder leaked to client: %s", s)
 	}
 }
@@ -74,7 +74,7 @@ func TestEndToEndStreamSplit(t *testing.T) {
 		if ph == "" {
 			t.Errorf("no placeholder sent upstream: %s", b)
 		}
-		// 把占位符拆成两个 data 行：[[PI | D_1]]
+		// 把占位符拆成两个 data 行：<<PII:PHONE: | 1>>
 		split := len(ph) / 2
 		half1 := ph[:split]
 		half2 := ph[split:]
@@ -111,7 +111,7 @@ func TestEndToEndStreamSplit(t *testing.T) {
 	if !strings.Contains(s, "13812345678") {
 		t.Fatalf("split placeholder not restored: %s", s)
 	}
-	if strings.Contains(s, "[[PID_") || strings.Contains(s, "[[PI") {
+	if strings.Contains(s, "<<PII:") || strings.Contains(s, "<<PI") {
 		t.Fatalf("placeholder leaked across chunks: %s", s)
 	}
 }
@@ -150,7 +150,7 @@ func TestEndToEndNonStream(t *testing.T) {
 	if !strings.Contains(s, "110101199003071234") {
 		t.Fatalf("non-stream not restored: %s", s)
 	}
-	if strings.Contains(s, "[[PID_") {
+	if strings.Contains(s, "<<PII:") {
 		t.Fatalf("placeholder leaked: %s", s)
 	}
 }
