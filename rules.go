@@ -39,6 +39,20 @@ func defaultRules() []Rule {
 		{Name: "中国大陆车牌", Type: "PLATE", Pattern: `[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领][A-HJ-NP-Z][A-HJ-NP-Z0-9]{5,6}`, Sample: "粤B12345"},
 		{Name: "固定电话", Type: "LANDLINE", Pattern: `0\d{2,3}-?\d{7,8}`, Sample: "0755-12345678"},
 		{Name: "中国护照", Type: "PASSPORT", Pattern: `(?i)[eghpsd]\d{8}`, Sample: "E12345678"},
+		// ---- 补充规则：证件 / 信用代码 / 网络 / 凭证类（覆盖更广）----
+		{Name: "港澳通行证", Type: "HKMO_PASS", Pattern: `\b[HM]\d{8,10}\b`, Sample: "H12345678"},
+		{Name: "统一社会信用代码", Type: "CREDIT_CODE", Pattern: `(?i)\b[0-9A-HJ-NPQRTUWXY]{2}\d{6}[0-9A-HJ-NPQRTUWXY]{10}\b`, Sample: "91310115MA1K3N5D6X"},
+		{Name: "组织机构代码", Type: "ORG_CODE", Pattern: `\b[0-9A-Z]{8}-?[0-9X]\b`, Sample: "12345678-9"},
+		{Name: "IPv4 地址", Type: "IPV4", Pattern: `\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b`, Sample: "192.168.1.100"},
+		{Name: "IPv6 地址", Type: "IPV6", Pattern: `(?i)\b(?:(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,7}:|(?:[0-9a-f]{1,4}:){1,6}:[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,5}(?::[0-9a-f]{1,4}){1,2}|(?:[0-9a-f]{1,4}:){1,4}(?::[0-9a-f]{1,4}){1,3}|(?:[0-9a-f]{1,4}:){1,3}(?::[0-9a-f]{1,4}){1,4}|(?:[0-9a-f]{1,4}:){1,2}(?::[0-9a-f]{1,4}){1,5}|[0-9a-f]{1,4}:(?::[0-9a-f]{1,4}){1,6})\b`, Sample: "2001:0db8:85a3:0000:0000:8a2e:0370:7334"},
+		{Name: "MAC 地址", Type: "MAC", Pattern: `(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b`, Sample: "aa:bb:cc:dd:ee:ff"},
+		{Name: "JWT", Type: "JWT", Pattern: `\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b`, Sample: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"},
+		{Name: "Bearer Token", Type: "BEARER", Pattern: `(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b`, Sample: "Bearer eyJ0eXAiOiJKV1QifQ.abc.def"},
+		{Name: "模型/OpenAI API Key", Type: "API_KEY", Pattern: `(?i)\b(?:sk-[A-Za-z0-9_-]{16,}|sk-ant-[A-Za-z0-9_-]{20,})\b`, Sample: "sk-abcdefghijklmnopqrstuvwxyz123456"},
+		{Name: "GitHub Token", Type: "GITHUB_TOKEN", Pattern: `(?i)\b(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)[A-Za-z0-9_]{15,}\b`, Sample: "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"},
+		{Name: "AWS Access Key", Type: "AWS_KEY", Pattern: `\bAKIA[0-9A-Z]{16}\b`, Sample: "AKIAIOSFODNN7EXAMPLE"},
+		{Name: "PEM 私钥", Type: "PEM_KEY", Pattern: `-----BEGIN [A-Z ]*PRIVATE KEY-----\s*[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`, Sample: "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAx\n-----END RSA PRIVATE KEY-----"},
+		{Name: "美国社会安全号", Type: "SSN_US", Pattern: `\b\d{3}-\d{2}-\d{4}\b`, Sample: "123-45-6789"},
 	}
 }
 
