@@ -59,11 +59,14 @@ PII_LISTEN=:3001 PII_TARGET=http://localhost:3000 ./pii-gateway
 ### 当前运行实例
 
 ```bash
-PII_LISTEN=:3002 PII_TARGET=http://localhost:3000 PII_ADMIN=:9088 ./pii-gateway
+PII_LISTEN=:3002 PII_TARGET=http://172.17.0.1:3029 PII_ADMIN=:9088 ./pii-gateway
 ```
 
-- 代理：`http://localhost:3002`
-- 管理面板：`http://localhost:9088`
+- 代理（本地）：`http://localhost:3002`
+- 管理面板（本地）：`http://localhost:9088`
+- 管理面板（公网）：`https://pii.hsfp.cn`（NPM 反代 → `172.17.0.1:9088`，复用 `*.hsfp.cn` 通配证书，强制 SSL+HSTS）
+
+> ⚠️ 域名目前只绑了**管理面板**。`/v1/*` 等 API 代理路径仅本地 `:3002` 可用；如需公网 API 入口，需在 NPM 再绑一个域名指向 `172.17.0.1:3002`。
 
 ## 接入 new-api
 
