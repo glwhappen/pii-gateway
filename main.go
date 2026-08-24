@@ -38,6 +38,9 @@ func main() {
 	if err := globalStore.loadFile(piiStoreFile); err != nil {
 		log.Printf("load pii store %s: %v", piiStoreFile, err)
 	}
+	if err := globalRules.load(); err != nil {
+		log.Printf("load rules %s: %v", rulesFile, err)
+	}
 	go startAdmin()
 	log.Printf("pii-gateway listening on %s, forwarding to %s", listenAddr, targetBase)
 	mux := http.NewServeMux()

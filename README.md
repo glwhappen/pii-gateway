@@ -46,6 +46,7 @@ PII_LISTEN=:3001 PII_TARGET=http://localhost:3000 ./pii-gateway
 | `PII_TARGET` | `http://localhost:3000` | 转发目标（你的 new-api 地址） |
 | `PII_ADMIN` | `:9090` | 管理面板端口 |
 | `PII_STORE_FILE` | `pii-store.json` | 映射落盘文件（含 PII，权限 0600，不提交 git） |
+| `PII_RULES_FILE` | `rules.json` | 正则规则落盘文件 |
 
 ## 管理面板
 
@@ -91,10 +92,16 @@ PII_LISTEN=:3002 PII_TARGET=http://172.17.0.1:3029 PII_ADMIN=:9088 PII_STORE_FIL
 
 > 如果网关和 new-api 不在同一 Docker 网络，`PII_TARGET` 用 `http://宿主机IP:3000`。
 
-## 当前 PII 规则（mask.go）
+## 正则规则（可配置）
+
+脱敏匹配规则可在管理面板增删，落盘持久化（`PII_RULES_FILE`）。默认两条：
 
 - 中国大陆手机号：`1[3-9][0-9]{9}`
-- 中国大陆身份证：`[0-9]{17}[0-9X]`
+- 中国大陆身份证：`(?i)[0-9]{17}[0-9X]`
+
+规则**按顺序执行**。API：`GET /api/rules` 列表、`POST /api/rules` 添加、`POST /api/rules/remove` 删除。非法正则会被拒绝。
+
+> ⚠️ **规则重叠注意**：正则按顺序逐个执行，先执行的正则会吃掉重叠部分。例如银行卡 `[0-9]{16,19}` 与身份证 `(?i)[0-9]{17}[0-9X]` 长度重叠：若身份证规则在前，19 位银行卡会被身份证规则先截走前 18 位（剩末位）。需要区分时请设计互斥正则（如银行卡用带 BIN 前缀的 `(?:62|4[0-9]|5[1-5])[0-9]{14,17}`，或用锚定/负向）。
 
 占位符格式 `[[PID_N]]`（纯字母数字下划线，不破坏 JSON），模型通常原样回显，便于还原。
 

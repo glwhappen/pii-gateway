@@ -15,12 +15,6 @@ import (
 // 且足够独特，模型正常情况下会原样返回、便于还原。
 var placeholderRe = regexp.MustCompile(`\[\[PID_[0-9]+\]\]`)
 
-// 中国大陆手机号：1[3-9] 开头共 11 位
-var phoneRe = regexp.MustCompile(`1[3-9][0-9]{9}`)
-
-// 身份证号：17 位数字 + 1 位数字或 X/x
-var idCardRe = regexp.MustCompile(`(?i)[0-9]{17}[0-9X]`)
-
 var pidCounter atomic.Uint64
 
 // piiStore 保存 真实值 <-> 占位符 的全局映射，保证同一内容跨请求复用同一占位符。
@@ -168,16 +162,18 @@ func newMapping() *mapping {
 }
 
 // mask 将 body 中的 PII 替换为占位符，并记录 占位符->真实值 映射。
-// 1. 内置正则（手机号/身份证）替换；
-// 2. 手动添加的自定义真实值（不匹配内置正则，如 1111）也在 body 出现时替换。
+// 1. 按全局规则（可配置正则，默认手机号/身份证）逐个替换；
+// 2. 手动添加的自定义真实值（不匹配任何规则，如 1111）也在 body 出现时替换。
 func mask(body []byte, m *mapping) []byte {
 	s := string(body)
-	s = idCardRe.ReplaceAllStringFunc(s, func(x string) string {
-		return maskOne(x, m)
-	})
-	s = phoneRe.ReplaceAllStringFunc(s, func(x string) string {
-		return maskOne(x, m)
-	})
+	for _, r := range globalRules.all() {
+		if r.re == nil {
+			continue
+		}
+		s = r.re.ReplaceAllStringFunc(s, func(x string) string {
+			return maskOne(x, m)
+		})
+	}
 	// 手动添加的自定义值：body 中出现即替换为其占位符
 	for _, e := range globalStore.manualEntries() {
 		if strings.Contains(s, e.Real) {
@@ -191,14 +187,14 @@ func mask(body []byte, m *mapping) []byte {
 	return []byte(s)
 }
 
-// manualEntries 返回 store 中「不匹配内置正则」的手动自定义映射。
+// manualEntries 返回 store 中「不匹配任何正则规则」的手动自定义映射。
 func (s *piiStore) manualEntries() []mappingEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []mappingEntry
 	for real, ph := range s.real2ph {
-		if phoneRe.MatchString(real) || idCardRe.MatchString(real) {
-			continue // 这类已由内置正则处理
+		if globalRules.matches(real) {
+			continue // 这类已由正则规则处理
 		}
 		out = append(out, mappingEntry{Placeholder: ph, Real: real})
 	}

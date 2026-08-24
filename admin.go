@@ -77,10 +77,6 @@ var logs = newLogStore(2000)
 
 var (
 	adminAddr = envOr("PII_ADMIN", ":9090")
-	rulesList = []map[string]string{
-		{"name": "中国大陆手机号", "pattern": `1[3-9][0-9]{9}`, "sample": "13812345678"},
-		{"name": "中国大陆身份证", "pattern": `[0-9]{17}[0-9X]`, "sample": "110101199003071234"},
-	}
 )
 
 // startAdmin 启动管理服务（独立端口，不干扰转发）。
@@ -90,6 +86,7 @@ func startAdmin() {
 	mux.HandleFunc("/api/health", adminHealth)
 	mux.HandleFunc("/api/logs", adminLogs)
 	mux.HandleFunc("/api/rules", adminRules)
+	mux.HandleFunc("/api/rules/remove", adminRuleRemove)
 	mux.HandleFunc("/api/mappings", adminMappings)
 	mux.HandleFunc("/api/mappings/clear", adminMappingsClear)
 	mux.HandleFunc("/api/self-test", adminSelfTest)
@@ -116,7 +113,62 @@ func adminLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func adminRules(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, rulesList)
+	switch r.Method {
+	case http.MethodGet:
+		rules := globalRules.all()
+		out := make([]map[string]string, 0, len(rules))
+		for _, rl := range rules {
+			out = append(out, map[string]string{"name": rl.Name, "pattern": rl.Pattern, "sample": rl.Sample})
+		}
+		writeJSON(w, map[string]any{"rules": out})
+	case http.MethodPost:
+		adminRuleAdd(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// adminRuleAdd 手动添加一条正则规则。
+func adminRuleAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name    string `json:"name"`
+		Pattern string `json:"pattern"`
+		Sample  string `json:"sample"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	pattern := strings.TrimSpace(req.Pattern)
+	if name == "" || pattern == "" {
+		http.Error(w, "name and pattern are required", http.StatusBadRequest)
+		return
+	}
+	if err := globalRules.add(name, pattern, req.Sample); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "name": name})
+}
+
+func adminRuleRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := globalRules.remove(req.Name); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func adminMappings(w http.ResponseWriter, r *http.Request) {
@@ -256,6 +308,20 @@ a{color:var(--accent)}
   </div>
 
   <div class="panel">
+    <h2>🧩 正则规则 <span class="muted">(脱敏匹配规则，可增删，落盘持久)</span></h2>
+    <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+      <input id="ruleName" class="inp" style="flex:1;min-width:140px" placeholder="规则名，如：银行卡号">
+      <input id="rulePattern" class="inp" style="flex:2;min-width:220px" placeholder="正则，如：\\d{16,19}" onkeydown="if(event.key==='Enter')addRule()">
+      <button onclick="addRule()">➕ 添加规则</button>
+    </div>
+    <div style="overflow-x:auto"><table>
+      <thead><tr><th>规则名</th><th>正则</th><th>示例</th><th></th></tr></thead>
+      <tbody id="ruleBody"></tbody>
+    </table></div>
+    <div class="muted" id="ruleEmpty" style="margin-top:10px">暂无规则</div>
+  </div>
+
+  <div class="panel">
     <h2>🗺️ 映射表 <span class="muted">(<span id="mapCount">0</span> 条 · 同一内容跨请求复用同一占位符)</span>
       <button style="float:right" onclick="clearMappings()">🗑️ 清除全部</button>
     </h2>
@@ -321,6 +387,26 @@ async function runSelfTest(){
   }catch(e){ $$('maskedOut').textContent='错误: '+e }
 }
 
+async function loadRules(){
+  try{
+    const d = await j('/api/rules');
+    $$('ruleBody').innerHTML = d.rules.map(r=>'<tr><td>'+r.name+'</td><td><code>'+r.pattern+'</code></td><td>'+(r.sample||'—')+'</td><td><button style="padding:2px 10px" onclick="removeRule('+JSON.stringify(r.name)+')">删</button></td></tr>').join('');
+    $$('ruleEmpty').style.display = d.rules.length? 'none':'block';
+  }catch(e){}
+}
+async function addRule(){
+  const name = $$('ruleName').value.trim(), pattern = $$('rulePattern').value.trim();
+  if(!name||!pattern){ alert('请填写规则名和正则'); return; }
+  try{
+    await j('/api/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,pattern})});
+    $$('ruleName').value=''; $$('rulePattern').value=''; loadRules();
+  }catch(e){ alert('添加失败: '+e) }
+}
+async function removeRule(name){
+  if(!confirm('删除规则「'+name+'」？')) return;
+  try{ await j('/api/rules/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}); loadRules(); }
+  catch(e){ alert('删除失败: '+e) }
+}
 async function loadMappings(){
   try{
     const d = await j('/api/mappings');
@@ -348,8 +434,8 @@ async function clearMappings(){
 }
 
 refresh();
-setInterval(()=>{ refresh(); loadMappings(); }, 1500);
-loadMappings();
+setInterval(()=>{ refresh(); loadMappings(); loadRules(); }, 1500);
+loadMappings(); loadRules();
 </script>
 </body>
 </html>
