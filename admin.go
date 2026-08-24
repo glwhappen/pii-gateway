@@ -593,6 +593,10 @@ button.danger:hover{background:var(--err-bg);filter:brightness(.97)}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
 .empty-row td{color:var(--muted);text-align:center;padding:18px 12px}
+.tabbar{position:sticky;top:0;z-index:50;display:flex;gap:6px;flex-wrap:wrap;background:var(--bg);padding:10px 0;border-bottom:1px solid var(--line);margin-bottom:18px}
+.tab-btn{background:var(--card);color:var(--fg-secondary);border:1px solid var(--line);border-radius:var(--radius-sm);padding:7px 14px;cursor:pointer;font-size:13px;font-weight:500;transition:all .15s}
+.tab-btn:hover{border-color:var(--line-strong);background:var(--surface)}
+.tab-btn.active{background:var(--accent);color:#fff;border-color:var(--accent);box-shadow:var(--shadow-md)}
 @media (max-width:640px){
   .wrap{padding:18px 16px}
   .pair{grid-template-columns:1fr}
@@ -611,9 +615,18 @@ a:hover{text-decoration:underline}
     <button class="theme-btn" id="themeBtn" onclick="toggleTheme()">☀️ 浅色</button>
   </div>
 
-  <div class="grid" id="stats"></div>
+  <div class="tabbar">
+    <button class="tab-btn active" data-tabbtn="overview" onclick="switchTab('overview')">📊 概览</button>
+    <button class="tab-btn" data-tabbtn="settings" onclick="switchTab('settings')">⚙️ 设置</button>
+    <button class="tab-btn" data-tabbtn="selftest" onclick="switchTab('selftest')">🧪 自测</button>
+    <button class="tab-btn" data-tabbtn="rules" onclick="switchTab('rules')">🧩 规则</button>
+    <button class="tab-btn" data-tabbtn="names" onclick="switchTab('names')">🛡️ 名单</button>
+    <button class="tab-btn" data-tabbtn="mappings" onclick="switchTab('mappings')">🗺️ 映射</button>
+  </div>
 
-  <div class="panel">
+  <div class="grid" id="stats" data-tab="overview"></div>
+
+  <div class="panel" data-tab="settings">
     <h2>⚙️ 设置 <span class="muted">(转发目标热生效；端口改动需重启)</span></h2>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
       <span class="muted" style="min-width:70px">转发目标</span>
@@ -645,7 +658,7 @@ a:hover{text-decoration:underline}
     <div id="cfgMsg" style="margin-top:8px"></div>
   </div>
 
-  <div class="panel">
+  <div class="panel" data-tab="selftest">
     <h2>🧪 脱敏自测（不调模型，直接演示）</h2>
     <textarea id="selftest" placeholder="输入包含手机号/身份证的文本，例如：我的电话是13812345678，身份证110101199003071234"></textarea>
     <div style="margin-top:10px"><button onclick="runSelfTest()">运行自测</button></div>
@@ -655,7 +668,7 @@ a:hover{text-decoration:underline}
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel" data-tab="rules">
     <h2>🧩 正则规则 <span class="muted">(脱敏匹配规则，可增删改，落盘持久)</span></h2>
     <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
       <input id="ruleName" class="inp" style="flex:1;min-width:140px" placeholder="规则名，如：银行卡号">
@@ -685,7 +698,7 @@ a:hover{text-decoration:underline}
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel" data-tab="names">
     <h2>🛡️ 敏感名单 <span class="muted">(姓名等固定词，正文出现即掩码为 &lt;&lt;PII:NAME:n&gt;&gt;，热生效)</span></h2>
     <div style="display:flex;gap:8px;margin-bottom:12px">
       <input id="newName" style="flex:1" class="inp" placeholder="输入姓名/敏感词，如：张三" onkeydown="if(event.key==='Enter')addName()">
@@ -695,7 +708,7 @@ a:hover{text-decoration:underline}
     <div class="muted" id="nameEmpty" style="margin-top:10px">暂无名单</div>
   </div>
 
-  <div class="panel">
+  <div class="panel" data-tab="mappings">
     <h2>🗺️ 映射表 <span class="muted">(<span id="mapCount">0</span> 条 · 同一内容跨请求复用同一占位符)</span>
       <button class="danger" style="float:right" onclick="clearMappings()">🗑️ 清除全部</button>
     </h2>
@@ -710,7 +723,7 @@ a:hover{text-decoration:underline}
     <div class="muted" id="mapEmpty" style="margin-top:10px">暂无映射</div>
   </div>
 
-  <div class="panel">
+  <div class="panel" data-tab="overview">
     <h2>🧾 实时转发日志 <span class="muted">(<span id="logCount">0</span> 条，自动刷新)</span></h2>
     <div style="overflow-x:auto"><table>
       <thead><tr><th>时间</th><th>IP</th><th>方法</th><th>路径</th><th>状态</th><th>耗时</th><th>脱敏</th><th>还原</th><th>残留</th></tr></thead>
@@ -907,6 +920,15 @@ async function clearMappings(){
   }catch(e){ alert('清除失败: '+e) }
 }
 
+function switchTab(name){
+  document.querySelectorAll('[data-tab]').forEach(el=>{
+    el.style.display = (el.getAttribute('data-tab')===name)? '' : 'none';
+  });
+  document.querySelectorAll('.tab-btn').forEach(b=>{
+    b.classList.toggle('active', b.getAttribute('data-tabbtn')===name);
+  });
+}
+
 function applyTheme(t){
   document.body.classList.toggle('theme-dark', t==='dark');
   localStorage.setItem('pii_theme', t);
@@ -950,6 +972,7 @@ async function saveConfig(){
 refresh();
 setInterval(()=>{ refresh(); loadMappings(); loadRules(); loadConfig(); loadNames(); }, 1500);
 loadMappings(); loadRules(); loadConfig(); loadNames();
+switchTab('overview');
 applyTheme(localStorage.getItem('pii_theme')||'light');
 </script>
 </body>
