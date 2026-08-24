@@ -35,6 +35,9 @@ var hopHeaders = map[string]bool{
 }
 
 func main() {
+	if err := globalStore.loadFile(piiStoreFile); err != nil {
+		log.Printf("load pii store %s: %v", piiStoreFile, err)
+	}
 	go startAdmin()
 	log.Printf("pii-gateway listening on %s, forwarding to %s", listenAddr, targetBase)
 	mux := http.NewServeMux()

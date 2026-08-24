@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -32,6 +34,9 @@ type piiStore struct {
 
 var globalStore = newPIIStore()
 
+// piiStoreFile 映射落盘路径（含 PII，权限 0600，不提交 git）。
+var piiStoreFile = envOr("PII_STORE_FILE", "pii-store.json")
+
 func newPIIStore() *piiStore {
 	return &piiStore{real2ph: make(map[string]string), ph2real: make(map[string]string)}
 }
@@ -43,11 +48,60 @@ func (s *piiStore) lookup(real string) (string, bool) {
 	return ph, ok
 }
 
-func (s *piiStore) remember(real, ph string) {
+func (s *piiStore) remember(real, ph string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.real2ph[real]; ok {
+		return false
+	}
 	s.real2ph[real] = ph
 	s.ph2real[ph] = real
+	return true
+}
+
+// loadFile 从磁盘加载映射（首次无文件则忽略），并恢复 pid 计数器避免冲突。
+func (s *piiStore) loadFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var raw struct {
+		Real2ph map[string]string `json:"real2ph"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.real2ph = raw.Real2ph
+	s.ph2real = make(map[string]string, len(raw.Real2ph))
+	var max uint64
+	for real, ph := range s.real2ph {
+		s.ph2real[ph] = real
+		if n := uint64(phNumber(ph)); n > max {
+			max = n
+		}
+	}
+	pidCounter.Store(max)
+	return nil
+}
+
+// saveFile 原子落盘（写临时文件后 rename），权限 0600。
+func (s *piiStore) saveFile(path string) error {
+	s.mu.Lock()
+	data, err := json.Marshal(map[string]any{"real2ph": s.real2ph})
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func (s *piiStore) size() int {
@@ -76,12 +130,13 @@ func (s *piiStore) list() []mappingEntry {
 	return out
 }
 
-// clear 清空全部映射。
+// clear 清空全部映射并落盘。
 func (s *piiStore) clear() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.real2ph = make(map[string]string)
 	s.ph2real = make(map[string]string)
+	s.mu.Unlock()
+	_ = s.saveFile(piiStoreFile)
 }
 
 // phNumber 解析占位符里的编号 [[PID_123]] -> 123。
@@ -113,15 +168,41 @@ func newMapping() *mapping {
 }
 
 // mask 将 body 中的 PII 替换为占位符，并记录 占位符->真实值 映射。
-// 返回掩码后的字节和映射。body 可为二进制/文本，仅对 UTF-8 文本敏感。
+// 1. 内置正则（手机号/身份证）替换；
+// 2. 手动添加的自定义真实值（不匹配内置正则，如 1111）也在 body 出现时替换。
 func mask(body []byte, m *mapping) []byte {
-	replaced := idCardRe.ReplaceAllStringFunc(string(body), func(s string) string {
-		return maskOne(s, m)
+	s := string(body)
+	s = idCardRe.ReplaceAllStringFunc(s, func(x string) string {
+		return maskOne(x, m)
 	})
-	replaced = phoneRe.ReplaceAllStringFunc(replaced, func(s string) string {
-		return maskOne(s, m)
+	s = phoneRe.ReplaceAllStringFunc(s, func(x string) string {
+		return maskOne(x, m)
 	})
-	return []byte(replaced)
+	// 手动添加的自定义值：body 中出现即替换为其占位符
+	for _, e := range globalStore.manualEntries() {
+		if strings.Contains(s, e.Real) {
+			s = strings.ReplaceAll(s, e.Real, e.Placeholder)
+			if _, ok := m.real[e.Placeholder]; !ok {
+				m.real[e.Placeholder] = e.Real
+				m.items = append(m.items, e.Placeholder, e.Real)
+			}
+		}
+	}
+	return []byte(s)
+}
+
+// manualEntries 返回 store 中「不匹配内置正则」的手动自定义映射。
+func (s *piiStore) manualEntries() []mappingEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []mappingEntry
+	for real, ph := range s.real2ph {
+		if phoneRe.MatchString(real) || idCardRe.MatchString(real) {
+			continue // 这类已由内置正则处理
+		}
+		out = append(out, mappingEntry{Placeholder: ph, Real: real})
+	}
+	return out
 }
 
 func maskOne(real string, m *mapping) string {
@@ -134,7 +215,9 @@ func maskOne(real string, m *mapping) string {
 	if !ok {
 		n := pidCounter.Add(1)
 		ph = "[[PID_" + strconv.FormatUint(n, 10) + "]]"
-		globalStore.remember(real, ph)
+		if globalStore.remember(real, ph) {
+			_ = globalStore.saveFile(piiStoreFile) // 新增映射立即落盘
+		}
 	}
 	// 记入本请求 mapping（还原用）；同一真实值只记一次，避免重复计数
 	if _, exists := m.real[ph]; !exists {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -92,6 +93,52 @@ func TestDeterministicMapping(t *testing.T) {
 	restored4 := string(restore(masked4, m4))
 	if !strings.Contains(restored4, "13812345678") {
 		t.Fatalf("restore failed: %s", restored4)
+	}
+}
+
+// 手动添加映射 + 落盘 + 重启加载：同一真实值保持同一占位符。
+func TestPersistAndManualAdd(t *testing.T) {
+	tdir := t.TempDir()
+	storeFile := tdir + "/store.json"
+
+	old := piiStoreFile
+	piiStoreFile = storeFile
+	defer func() { piiStoreFile = old }()
+
+	ResetPIIStore()
+
+	// 手动添加
+	ph, ok := globalStore.lookup("1111")
+	if ok {
+		t.Fatalf("1111 should not exist yet")
+	}
+	n := pidCounter.Add(1)
+	ph = "[[PID_" + strconv.FormatUint(n, 10) + "]]"
+	globalStore.remember("1111", ph)
+	if err := globalStore.saveFile(storeFile); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟重启：重置 store 并从文件加载
+	ResetPIIStore()
+	if err := globalStore.loadFile(storeFile); err != nil {
+		t.Fatal(err)
+	}
+
+	// 重启后 1111 仍在，且占位符一致
+	got, ok := globalStore.lookup("1111")
+	if !ok {
+		t.Fatalf("1111 not persisted after reload")
+	}
+	if got != ph {
+		t.Fatalf("placeholder changed after reload: %s vs %s", got, ph)
+	}
+
+	// mask 遇到 1111 复用同一占位符
+	m := newMapping()
+	masked := mask([]byte("内容 1111 其他"), m)
+	if !strings.Contains(string(masked), ph) {
+		t.Fatalf("1111 not masked to persisted placeholder %s: %s", ph, masked)
 	}
 }
 

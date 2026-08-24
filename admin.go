@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -118,10 +120,45 @@ func adminRules(w http.ResponseWriter, r *http.Request) {
 }
 
 func adminMappings(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]any{
-		"size":    globalStore.size(),
-		"entries": globalStore.list(),
-	})
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]any{
+			"size":    globalStore.size(),
+			"entries": globalStore.list(),
+		})
+	case http.MethodPost:
+		adminMappingsAdd(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// adminMappingsAdd 手动添加一条映射：传真实值，自动分配占位符并落盘。
+func adminMappingsAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Real string `json:"real"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	real := strings.TrimSpace(req.Real)
+	if real == "" {
+		http.Error(w, "real is required", http.StatusBadRequest)
+		return
+	}
+	// 已存在则直接返回现有占位符
+	if ph, ok := globalStore.lookup(real); ok {
+		writeJSON(w, map[string]any{"placeholder": ph, "real": real, "new": false})
+		return
+	}
+	n := pidCounter.Add(1)
+	ph := "[[PID_" + strconv.FormatUint(n, 10) + "]]"
+	globalStore.remember(real, ph)
+	if err := globalStore.saveFile(piiStoreFile); err != nil {
+		log.Printf("save pii store: %v", err)
+	}
+	writeJSON(w, map[string]any{"placeholder": ph, "real": real, "new": true})
 }
 
 func adminMappingsClear(w http.ResponseWriter, r *http.Request) {
@@ -191,6 +228,7 @@ th{color:var(--muted);font-weight:normal}
 tr:hover td{background:rgba(255,255,255,.02)}
 .err{color:var(--err)}.okc{color:var(--ok)}
 textarea{width:100%;min-height:70px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:10px;font-family:inherit;resize:vertical}
+.inp{flex:1;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-family:inherit}
 button{background:var(--accent);border:none;color:#fff;padding:8px 16px;border-radius:8px;cursor:pointer;font-size:14px}
 button:hover{opacity:.9}
 .pair{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
@@ -221,6 +259,10 @@ a{color:var(--accent)}
     <h2>🗺️ 映射表 <span class="muted">(<span id="mapCount">0</span> 条 · 同一内容跨请求复用同一占位符)</span>
       <button style="float:right" onclick="clearMappings()">🗑️ 清除全部</button>
     </h2>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <input id="newReal" style="flex:1" class="inp" placeholder="手动添加真实值，如 1111 —— 自动分配占位符" onkeydown="if(event.key==='Enter')addMapping()">
+      <button onclick="addMapping()">➕ 添加</button>
+    </div>
     <div style="overflow-x:auto"><table>
       <thead><tr><th>占位符</th><th>真实值</th></tr></thead>
       <tbody id="mapBody"></tbody>
@@ -286,6 +328,16 @@ async function loadMappings(){
     $$('mapBody').innerHTML = d.entries.map(e=>'<tr><td>'+e.placeholder+'</td><td>'+e.real+'</td></tr>').join('');
     $$('mapEmpty').style.display = d.size? 'none':'block';
   }catch(e){}
+}
+async function addMapping(){
+  const real = $$('newReal').value.trim();
+  if(!real){ alert('请输入要添加的真实值'); return; }
+  try{
+    const r = await j('/api/mappings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({real})});
+    alert('已'+(r.new?'新增':'复用')+'映射：'+r.real+' → '+r.placeholder);
+    $$('newReal').value='';
+    loadMappings();
+  }catch(e){ alert('添加失败: '+e) }
 }
 async function clearMappings(){
   if(!confirm('确定清除全部映射？清除后同一内容会重新分配新的占位符。')) return;
