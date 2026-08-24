@@ -855,7 +855,7 @@ a:hover{text-decoration:underline}
     <h2>⚙️ 设置 <span class="muted">(转发目标热生效；端口改动需重启)</span></h2>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
       <span class="muted" style="min-width:70px">转发目标</span>
-      <input id="cfgTarget" class="inp" style="flex:1;min-width:240px" placeholder="http://172.17.0.1:3029">
+      <input id="cfgTarget" class="inp" style="flex:1;min-width:240px" placeholder="http://localhost:3000">
       <button onclick="saveConfig()">💾 保存</button>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
