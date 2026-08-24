@@ -492,6 +492,18 @@ func newSelftestHistory(cap int) *selftestHistory {
 
 func (h *selftestHistory) add(e HistoryEntry) {
 	h.mu.Lock()
+	// 去重：相同输入文本不新增，只刷新该条时间与本次最新结果
+	for i := range h.buf {
+		if h.buf[i].Text == e.Text {
+			h.buf[i].Time = time.Now().Format("2006-01-02 15:04:05")
+			h.buf[i].Masked = e.Masked
+			h.buf[i].Restored = e.Restored
+			h.buf[i].Count = e.Count
+			h.mu.Unlock()
+			_ = h.save()
+			return
+		}
+	}
 	h.seq++
 	e.ID = h.seq
 	e.Time = time.Now().Format("2006-01-02 15:04:05")

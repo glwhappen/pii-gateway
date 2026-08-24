@@ -8,6 +8,35 @@ import (
 	"testing"
 )
 
+// 历史去重：相同输入文本不新增，只刷新时间与结果。
+func TestSelfTestHistoryDedup(t *testing.T) {
+	oldFile := selftestHistFile
+	selftestHistFile = t.TempDir() + "/h.json"
+	selftestHist = newSelftestHistory(100)
+	defer func() { selftestHistFile = oldFile }()
+
+	selftestHist.add(HistoryEntry{Text: "t1", Masked: "m", Restored: "r", Count: 1})
+	selftestHist.add(HistoryEntry{Text: "t2", Masked: "m2", Restored: "r2", Count: 2})
+	selftestHist.add(HistoryEntry{Text: "t1", Masked: "m1-new", Restored: "r1-new", Count: 9})
+
+	list := selftestHist.list()
+	if len(list) != 2 {
+		t.Fatalf("去重后应为 2 条, got %d", len(list))
+	}
+	found := false
+	for _, e := range list {
+		if e.Text == "t1" {
+			if e.Count != 9 || e.Masked != "m1-new" {
+				t.Fatalf("t1 未刷新为最新结果: %+v", e)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("t1 应存在")
+	}
+}
+
 // 自测：加密传输往返 + 历史服务端落盘。
 func TestSelfTestHistoryEncrypted(t *testing.T) {
 	oldFile := selftestHistFile
