@@ -213,6 +213,11 @@ func restoreDataLine(line string, m *mapping, carry string) (string, string) {
 // restoreContent 对单个 content 值做跨行占位符拼接还原。
 // 返回 (可输出的 content 值, 遗留的未闭合前缀)。
 func restoreContent(value string, m *mapping, carry string) (string, string) {
+	// 模型可能把占位符里的 < > 输出为 JSON 转义形式(\u003c \u003e)，例如
+	// "\u003c\u003cPII:NAME:31\u003e\u003e"。先把转义尖括号还原为字面 < >，
+	// 否则 splitDangling 只认字面量前缀 <<PII: 而无法跨 chunk 拼接占位符。
+	value = strings.ReplaceAll(value, `\u003c`, "<")
+	value = strings.ReplaceAll(value, `\u003e`, ">")
 	combined := carry + value
 	head, tail := splitDangling(combined)
 	if tail != "" {
