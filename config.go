@@ -17,6 +17,9 @@ var systemHint = defaultSystemHint
 // systemHintEnabled 是否注入说明（默认关闭；关闭时即使 systemHint 有文字也不注入，但保留文字）。
 var systemHintEnabled = false
 
+// namesList 敏感名单（姓名等），正文出现即掩码。由 applyConfig 设置，可热生效。
+var namesList []string
+
 // onOffToBool 把 "on"/"1"/"true" 等解析为布尔，无法识别时返回 def。
 func onOffToBool(s string, def bool) bool {
 	switch strings.ToLower(strings.TrimSpace(s)) {
@@ -41,6 +44,7 @@ type appConfig struct {
 	PlaceholderSuffix string `json:"placeholder_suffix"` // 占位符后缀
 	SystemHint        string `json:"system_hint"`        // 注入给上游模型的说明（提醒保留占位符），可热生效
 	SystemHintEnabled string `json:"system_hint_enabled"` // 是否注入说明："on"/"off"，空用默认(关闭)
+	Names             []string `json:"names"`            // 敏感名单（姓名等），正文出现即掩码，可热生效
 }
 
 // configStore 并发安全的配置存取。
@@ -113,6 +117,9 @@ func mergeNonEmpty(dst *appConfig, src *appConfig) {
 	if src.SystemHintEnabled != "" {
 		dst.SystemHintEnabled = src.SystemHintEnabled
 	}
+	if src.Names != nil { // 名单：空数组与未设置可区分
+		dst.Names = src.Names
+	}
 }
 
 // applyConfig 把端口/文件类配置同步到全局变量（这些在启动时使用）。
@@ -123,6 +130,7 @@ func applyConfig(c appConfig) {
 	rulesFile = c.RulesFile
 	systemHint = c.SystemHint
 	systemHintEnabled = onOffToBool(c.SystemHintEnabled, false)
+	namesList = c.Names
 }
 
 func (s *configStore) Target() string {

@@ -161,6 +161,26 @@ func mask(body []byte, m *mapping) []byte {
 			return maskOne(x, m, typ)
 		})
 	}
+	// 敏感名单（姓名等）：正文出现即掩码，确定性复用同一占位符。
+	// 按长度降序处理，避免短名先替换长名内的子串。
+	for _, nm := range sortedNames() {
+		if !strings.Contains(s, nm) {
+			continue
+		}
+		ph, ok := globalStore.lookup(nm)
+		if !ok {
+			n := pidCounter.Add(1)
+			ph = phFor("NAME", n)
+			if globalStore.remember(nm, ph) {
+				_ = globalStore.saveFile(piiStoreFile)
+			}
+		}
+		s = strings.ReplaceAll(s, nm, ph)
+		if _, exists := m.real[ph]; !exists {
+			m.real[ph] = nm
+			m.items = append(m.items, ph, nm)
+		}
+	}
 	// 手动添加的自定义值：body 中出现即替换为其占位符。
 	// 注意：manualEntries 来自 map 迭代顺序不确定，必须按真实值长度降序排序后再替换，
 	// 否则短值（如 123）可能先替换长值（如 1234）里的子串，把 1234 拆开残留明文。
@@ -177,6 +197,22 @@ func mask(body []byte, m *mapping) []byte {
 		}
 	}
 	return []byte(s)
+}
+
+// sortedNames 返回去重、按长度降序的敏感名单（长名优先，避免短名先替换长名子串）。
+func sortedNames() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, nm := range namesList {
+		nm = strings.TrimSpace(nm)
+		if nm == "" || seen[nm] {
+			continue
+		}
+		seen[nm] = true
+		out = append(out, nm)
+	}
+	sort.Slice(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
+	return out
 }
 
 // manualEntries 返回 store 中「不匹配任何正则规则」的手动自定义映射。

@@ -93,6 +93,8 @@ func startAdmin() {
 	mux.HandleFunc("/api/rules/update", adminRuleUpdate)
 	mux.HandleFunc("/api/rules/remove", adminRuleRemove)
 	mux.HandleFunc("/api/config", adminConfig)
+	mux.HandleFunc("/api/names", adminNames)
+	mux.HandleFunc("/api/names/remove", adminNameRemove)
 	mux.HandleFunc("/api/mappings", adminMappings)
 	mux.HandleFunc("/api/mappings/clear", adminMappingsClear)
 	mux.HandleFunc("/api/self-test", adminSelfTest)
@@ -267,6 +269,81 @@ func adminRuleAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "name": name})
+}
+
+// adminNames 读取/添加敏感名单（姓名等，正文出现即掩码，热生效）。
+func adminNames(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]any{"names": namesList})
+	case http.MethodPost:
+		adminNameAdd(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func adminNameAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	nm := strings.TrimSpace(req.Name)
+	if nm == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	c := appCfg.Get()
+	for _, x := range c.Names {
+		if strings.TrimSpace(x) == nm {
+			http.Error(w, "已在名单中", http.StatusBadRequest)
+			return
+		}
+	}
+	c.Names = append(c.Names, nm)
+	if err := appCfg.Save(c); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "name": nm})
+}
+
+func adminNameRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	nm := strings.TrimSpace(req.Name)
+	c := appCfg.Get()
+	out := c.Names[:0]
+	found := false
+	for _, x := range c.Names {
+		if strings.TrimSpace(x) == nm {
+			found = true
+			continue
+		}
+		out = append(out, x)
+	}
+	if !found {
+		http.Error(w, "不在名单中", http.StatusBadRequest)
+		return
+	}
+	c.Names = out
+	if err := appCfg.Save(c); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func adminRuleRemove(w http.ResponseWriter, r *http.Request) {
@@ -609,6 +686,16 @@ a:hover{text-decoration:underline}
   </div>
 
   <div class="panel">
+    <h2>🛡️ 敏感名单 <span class="muted">(姓名等固定词，正文出现即掩码为 &lt;&lt;PII:NAME:n&gt;&gt;，热生效)</span></h2>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <input id="newName" style="flex:1" class="inp" placeholder="输入姓名/敏感词，如：张三" onkeydown="if(event.key==='Enter')addName()">
+      <button onclick="addName()">➕ 添加</button>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px" id="nameBody"></div>
+    <div class="muted" id="nameEmpty" style="margin-top:10px">暂无名单</div>
+  </div>
+
+  <div class="panel">
     <h2>🗺️ 映射表 <span class="muted">(<span id="mapCount">0</span> 条 · 同一内容跨请求复用同一占位符)</span>
       <button class="danger" style="float:right" onclick="clearMappings()">🗑️ 清除全部</button>
     </h2>
@@ -739,6 +826,28 @@ async function removeRule(name){
   try{ await j('/api/rules/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}); loadRules(); }
   catch(e){ alert('删除失败: '+e) }
 }
+// ---- 敏感名单 ----
+async function loadNames(){
+  try{
+    const d = await j('/api/names');
+    $$('nameBody').innerHTML = d.names.map(n=>
+      '<span style="display:inline-flex;align-items:center;gap:6px;background:var(--accent-bg);border:1px solid var(--accent);border-radius:999px;padding:4px 10px;font-size:13px">'
+      +escapeHtml(n)+' <button class="danger" style="padding:0 7px;line-height:1.6" onclick="removeName('+escapeHtml(JSON.stringify(n))+')">✕</button></span>'
+    ).join('') || '';
+    $$('nameEmpty').style.display = d.names.length? 'none':'block';
+  }catch(e){}
+}
+async function addName(){
+  const n = $$('newName').value.trim();
+  if(!n){ alert('请输入姓名/敏感词'); return; }
+  try{ await j('/api/names',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}); $$('newName').value=''; loadNames(); }
+  catch(e){ alert('添加失败: '+e) }
+}
+async function removeName(n){
+  if(!confirm('从敏感名单移除「'+n+'」？')) return;
+  try{ await j('/api/names/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}); loadNames(); }
+  catch(e){ alert('移除失败: '+e) }
+}
 // ---- 映射表真实值传输加密（AES-256-GCM，与后端共享密钥）----
 const MAP_SECRET = 'pii-gateway-map-secret-2026';
 async function mapKey(){
@@ -839,8 +948,8 @@ async function saveConfig(){
 }
 
 refresh();
-setInterval(()=>{ refresh(); loadMappings(); loadRules(); loadConfig(); }, 1500);
-loadMappings(); loadRules(); loadConfig();
+setInterval(()=>{ refresh(); loadMappings(); loadRules(); loadConfig(); loadNames(); }, 1500);
+loadMappings(); loadRules(); loadConfig(); loadNames();
 applyTheme(localStorage.getItem('pii_theme')||'light');
 </script>
 </body>
