@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -134,6 +135,24 @@ func (s *piiStore) list() []mappingEntry {
 		return phNumber(out[i].Placeholder) < phNumber(out[j].Placeholder)
 	})
 	return out
+}
+
+// delete 按占位符删除单条映射并落盘。返回被删除的真实值；占位符不存在时返回 false。
+func (s *piiStore) delete(ph string) (real string, ok bool) {
+	s.mu.Lock()
+	real, ok = s.ph2real[ph]
+	if !ok {
+		s.mu.Unlock()
+		return "", false
+	}
+	delete(s.ph2real, ph)
+	delete(s.real2ph, real)
+	delete(s.ignored, real)
+	s.mu.Unlock()
+	if err := s.saveFile(piiStoreFile); err != nil {
+		log.Printf("save pii store: %v", err)
+	}
+	return real, true
 }
 
 // clear 清空全部映射并落盘。

@@ -98,6 +98,7 @@ func startAdmin() {
 	mux.HandleFunc("/api/names/remove", adminNameRemove)
 	mux.HandleFunc("/api/mappings", adminMappings)
 	mux.HandleFunc("/api/mappings/ignore", adminMappingIgnore)
+	mux.HandleFunc("/api/mappings/delete", adminMappingDelete)
 	mux.HandleFunc("/api/mappings/clear", adminMappingsClear)
 	mux.HandleFunc("/api/self-test", adminSelfTest)
 	mux.HandleFunc("/api/self-test/history", adminSelftestHistory)
@@ -446,6 +447,26 @@ func adminMappingIgnore(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := globalStore.setIgnored(req.Placeholder, req.Ignored); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// adminMappingDelete 按占位符删除单条映射（同时清除其忽略状态并落盘）。
+func adminMappingDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Placeholder string `json:"placeholder"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, ok := globalStore.delete(req.Placeholder); !ok {
+		http.Error(w, "占位符不存在", http.StatusBadRequest)
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true})
@@ -1222,6 +1243,13 @@ async function toggleIgnore(ph, cur, btn){
     if(btn){ btn.textContent = cur? '✅ 已忽略':'忽略'; btn.className = cur? '':'secondary'; }
     alert('操作失败: '+e);
   }
+}
+async function deleteMapping(ph){
+  if(!confirm('确定删除该映射？删除后同一内容会重新分配新的占位符。')) return;
+  try{
+    await j('/api/mappings/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({placeholder:ph})});
+    loadMappings();
+  }catch(e){ alert('删除失败: '+e) }
 }
 async function addMapping(){
   const real = $$('newReal').value.trim();
