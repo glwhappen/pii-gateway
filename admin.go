@@ -692,6 +692,13 @@ a:hover{text-decoration:underline}
       <div><div class="lbl">脱敏后（发往上游）</div><div class="out" id="maskedOut">—</div></div>
       <div><div class="lbl">还原后（返回客户端）</div><div class="out" id="restoredOut">—</div></div>
     </div>
+    <div style="margin-top:18px">
+      <h2 style="margin-bottom:10px">📜 自测历史
+        <button class="danger" style="float:right" onclick="clearSelftestHistory()">🗑️ 清空</button>
+      </h2>
+      <div id="stHistory"></div>
+      <div class="muted" style="font-size:12px;margin-top:6px">历史保存在本地浏览器，可点击「🔄 重测」重新运行</div>
+    </div>
   </div>
 
   <div class="panel" data-tab="rules">
@@ -800,7 +807,46 @@ async function runSelfTest(){
     const r = await j('/api/self-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
     $$('maskedOut').textContent = r.masked;
     $$('restoredOut').textContent = r.restored + (r.count? '\n（共脱敏 '+r.count+' 处）':'');
+    saveSelftestHistory(text, r);
   }catch(e){ $$('maskedOut').textContent='错误: '+e }
+}
+// ---- 自测历史（localStorage，本地持久）----
+const ST_HIST_KEY = 'pii_selftest_history';
+function saveSelftestHistory(text, r){
+  let h = [];
+  try{ h = JSON.parse(localStorage.getItem(ST_HIST_KEY)||'[]'); }catch(e){}
+  h.unshift({time:new Date().toLocaleString('zh-CN'), text, masked:r.masked, restored:r.restored, count:r.count||0});
+  if(h.length>30) h = h.slice(0,30);
+  localStorage.setItem(ST_HIST_KEY, JSON.stringify(h));
+  renderSelftestHistory();
+}
+function renderSelftestHistory(){
+  let h = [];
+  try{ h = JSON.parse(localStorage.getItem(ST_HIST_KEY)||'[]'); }catch(e){}
+  if(!h.length){ $$('stHistory').innerHTML='<div class="muted" style="margin-top:6px">暂无历史</div>'; return; }
+  $$('stHistory').innerHTML = '<div style="overflow-x:auto"><table><thead><tr><th>时间</th><th>输入</th><th>脱敏</th><th style="width:150px"></th></tr></thead><tbody>'+
+    h.map((x,i)=>'<tr><td>'+escapeHtml(x.time)+'</td><td title="'+escapeHtml(x.text)+'">'+escapeHtml(truncate(x.text,26))+'</td><td>'+x.count+'</td>'+
+      '<td><button class="secondary" style="padding:3px 10px;margin-right:6px" onclick="rerunSelftest('+i+')">🔄 重测</button>'+
+      '<button class="danger" style="padding:3px 10px" onclick="removeSelftestHistory('+i+')">删除</button></td></tr>').join('')+'</tbody></table></div>';
+}
+function rerunSelftest(i){
+  let h = [];
+  try{ h = JSON.parse(localStorage.getItem(ST_HIST_KEY)||'[]'); }catch(e){}
+  if(!h[i]) return;
+  $$('selftest').value = h[i].text; // 填回输入框
+  runSelftest();                    // 重新测试（会记录新历史）
+}
+function removeSelftestHistory(i){
+  let h = [];
+  try{ h = JSON.parse(localStorage.getItem(ST_HIST_KEY)||'[]'); }catch(e){}
+  h.splice(i,1);
+  localStorage.setItem(ST_HIST_KEY, JSON.stringify(h));
+  renderSelftestHistory();
+}
+function clearSelftestHistory(){
+  if(!confirm('确定清空自测历史？')) return;
+  localStorage.removeItem(ST_HIST_KEY);
+  renderSelftestHistory();
 }
 
 function truncate(s, n){
@@ -986,7 +1032,7 @@ function switchTab(name){
   else if(name==='rules') loadRules();
   else if(name==='names') loadNames();
   else if(name==='mappings') loadMappings();
-  // selftest 无需预加载
+  else if(name==='selftest') renderSelftestHistory();
 }
 
 function applyTheme(t){
