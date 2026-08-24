@@ -245,3 +245,23 @@ func TestMapEncryptDecrypt(t *testing.T) {
 		t.Fatalf("expected error for tampered ciphertext")
 	}
 }
+
+
+// 追加一个更健壮的转义还原测试（用实际占位符编号）
+func TestRestoreJSONEscapedReal(t *testing.T) {
+	ResetPIIStore()
+	m := newMapping()
+	masked := string(mask([]byte("电话13812345678"), m))
+	ph := placeholderRe.FindString(masked)
+	if ph == "" {
+		t.Fatalf("未生成占位符: %s", masked)
+	}
+	escaped := `{"content":"电话是` + strings.ReplaceAll(strings.ReplaceAll(ph, "<", `\u003c`), ">", `\u003e`) + `"}`
+	out := string(restore([]byte(escaped), m))
+	if !strings.Contains(out, "13812345678") {
+		t.Fatalf("转义占位符未还原: %s", out)
+	}
+	if strings.Contains(out, "<<PII:") {
+		t.Fatalf("残留: %s", out)
+	}
+}

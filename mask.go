@@ -320,6 +320,10 @@ func restore(data []byte, m *mapping) []byte {
 		return data
 	}
 	s := string(data)
+	// 上游用 JSON 序列化响应时会把 < > 转义成 \u003c \u003e，使占位符 <<PII:...>> 变形、
+	// 正则匹配不到而无法还原。这里先把转义尖括号反转义回 < >，再还原占位符。
+	s = strings.ReplaceAll(s, `\u003c`, "<")
+	s = strings.ReplaceAll(s, `\u003e`, ">")
 	// 优先还原长的（身份证占位符与手机号长度相同，但保守起见逐个替换）
 	for _, ph := range allPlaceholders(s) {
 		if real, ok := m.real[ph]; ok {

@@ -137,7 +137,7 @@ func restoreBody(w http.ResponseWriter, resp *http.Response, m *mapping) int {
 		log.Printf("read upstream body: %v", err)
 	}
 	data = restore(data, m)
-	if strings.Contains(string(data), "[[PID_") {
+	if strings.Contains(string(data), "<<PII:") {
 		m.Residual = true
 	}
 	w.WriteHeader(resp.StatusCode)
@@ -167,7 +167,7 @@ func restoreStream(w http.ResponseWriter, r *http.Request, resp *http.Response, 
 		if strings.HasPrefix(line, "data:") {
 			line, carry = restoreDataLine(line, m, carry)
 		}
-		if strings.Contains(line, "[[PID_") {
+		if strings.Contains(line, "<<PII:") {
 			m.Residual = true
 		}
 		if _, err := fmt.Fprintln(w, line); err != nil {
