@@ -45,6 +45,14 @@ func (s *piiStore) lookup(real string) (string, bool) {
 	return ph, ok
 }
 
+// lookupByPh 按占位符反查真实值（用于响应还原时对全局持久映射的兜底查询）。
+func (s *piiStore) lookupByPh(ph string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	real, ok := s.ph2real[ph]
+	return real, ok
+}
+
 func (s *piiStore) remember(real, ph string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -335,7 +343,7 @@ func (m *mapping) MaskedCount() int { return len(m.items) / 2 }
 // restore 将 data 中的占位符还原为真实值。
 // 对每个占位符做普通字符串替换（占位符不含 JSON 特殊字符，安全）。
 func restore(data []byte, m *mapping) []byte {
-	if m == nil || len(m.real) == 0 {
+	if m == nil {
 		return data
 	}
 	s := string(data)
@@ -345,7 +353,13 @@ func restore(data []byte, m *mapping) []byte {
 	s = strings.ReplaceAll(s, `\u003e`, ">")
 	// 优先还原长的（身份证占位符与手机号长度相同，但保守起见逐个替换）
 	for _, ph := range allPlaceholders(s) {
-		if real, ok := m.real[ph]; ok {
+		// 先查本次请求内脱敏建立的映射（m.real）；跨请求/上下文压缩时明文来源可能已不在
+		// 本次 body，查不到则回退到全局持久映射（ph2real），保证已脱敏过的名字也能还原。
+		real, ok := m.real[ph]
+		if !ok {
+			real, ok = globalStore.lookupByPh(ph)
+		}
+		if ok {
 			s = strings.ReplaceAll(s, ph, real)
 			m.Restored++
 		}
