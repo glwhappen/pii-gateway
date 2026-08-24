@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -264,4 +265,42 @@ func TestRestoreJSONEscapedReal(t *testing.T) {
 	if strings.Contains(out, "<<PII:") {
 		t.Fatalf("残留: %s", out)
 	}
+}
+
+// TestMaskJSONNumbersKept 回归测试：脱敏不得改写 JSON 裸数字字段（如 seed/top_p/时间戳），
+// 否则替换成占位符会破坏 JSON 结构，导致上游 new-api 报 "invalid JSON request body"。
+// 只应对字符串值内的 PII 脱敏，数字字段原样保留且整体仍是合法 JSON。
+func TestMaskJSONNumbersKept(t *testing.T) {
+	ResetPIIStore()
+	body := `{"model":"muse-glimmer-30b","seed":13812345678,"top_p":13812345678,"temperature":110101199003071234,"max_tokens":8192,"messages":[{"role":"user","content":"电话13812345678"}]}`
+	m := newMapping()
+	masked := mask([]byte(body), m)
+
+	if !jsonValid(masked) {
+		t.Fatalf("masked body is not valid JSON: %s", masked)
+	}
+	s := string(masked)
+	// 裸数字字段必须原样保留
+	for _, field := range []string{`"seed":13812345678`, `"top_p":13812345678`, `"temperature":110101199003071234`, `"max_tokens":8192`} {
+		if !strings.Contains(s, field) {
+			t.Fatalf("number field %s was masked, JSON broken: %s", field, s)
+		}
+	}
+	// 字符串值内的 PII 仍应脱敏（content 字段内不应再出现明文电话）
+	if strings.Contains(s, `"content":"电话13812345678"`) {
+		t.Fatalf("PII inside string value not masked: %s", s)
+	}
+	if !strings.Contains(s, `"content":"电话<<PII:`) {
+		t.Fatalf("no placeholder produced in string value: %s", s)
+	}
+	// 还原应恢复原文
+	restored := restore(masked, m)
+	if string(restored) != string(body) {
+		t.Fatalf("roundtrip mismatch:\n got: %s\nwant: %s", restored, body)
+	}
+}
+
+func jsonValid(b []byte) bool {
+	var v interface{}
+	return json.Unmarshal(b, &v) == nil
 }

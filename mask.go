@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"sort"
@@ -223,11 +225,23 @@ func mask(body []byte, m *mapping) []byte {
 }
 
 // maskWith 与 mask 相同，但使用传入的 store（可隔离、可禁止落盘）。
+// body 为合法 JSON 时仅对字符串值（value）脱敏，避免规则正则把 JSON 里的裸数字字段
+// （如 "seed":13812345678、"top_p":13812345678、时间戳等）替换成占位符后破坏 JSON 结构；
+// 非 JSON（或 JSON 解析异常）时回退到全文本替换。
+func maskWith(st *piiStore, body []byte, m *mapping) []byte {
+	if json.Valid(body) {
+		if out, ok := maskJSONStrings(st, body, m); ok {
+			return out
+		}
+	}
+	return []byte(maskText(st, string(body), m))
+}
+
+// maskText 对单个文本串执行三步脱敏：
 // 1. 按全局规则（可配置正则）逐个替换；
 // 2. 敏感名单（姓名等）出现即替换；
 // 3. 手动添加的自定义值（不匹配任何规则）出现即替换。
-func maskWith(st *piiStore, body []byte, m *mapping) []byte {
-	s := string(body)
+func maskText(st *piiStore, s string, m *mapping) string {
 	s = maskRules(st, s, m)
 	// 敏感名单（姓名等）：正文出现即掩码，确定性复用同一占位符。
 	// 按长度降序处理，避免短名先替换长名内的子串。
@@ -267,7 +281,81 @@ func maskWith(st *piiStore, body []byte, m *mapping) []byte {
 			}
 		}
 	}
-	return []byte(s)
+	return s
+}
+
+// maskJSONStrings 对合法 JSON body 做保序脱敏：只替换字符串值（value）中的 PII，
+// 对象的 key、数字/布尔/null 字段、结构符号与空白均保留原始字节（含精度与顺序）。
+// 返回 (脱敏后的 body, 是否成功)。任何解析异常均返回 (nil, false) 由调用方回退。
+func maskJSONStrings(st *piiStore, body []byte, m *mapping) ([]byte, bool) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	var out bytes.Buffer
+	prev := dec.InputOffset()
+	// 上下文栈：每层对象记录下一个字符串 token 是 key 还是 value；数组元素均为 value。
+	const (
+		ctxObjExpectKey   = 1
+		ctxObjExpectValue = 2
+		ctxArray          = 3
+	)
+	var stack []int
+	for {
+		offBefore := dec.InputOffset()
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, false
+		}
+		off := dec.InputOffset()
+		raw := body[offBefore:off]
+		// raw 可能含 token 前导空白与结构字符（: ,），分离出需原样保留的前缀与 token 本体
+		trim := len(raw) - len(bytes.TrimLeft(raw, " \t\r\n:,"))
+		prefix := raw[:trim]
+
+		isValue := len(stack) == 0 || stack[len(stack)-1] != ctxObjExpectKey
+		switch t := tok.(type) {
+		case json.Delim:
+			switch t {
+			case '{':
+				stack = append(stack, ctxObjExpectKey)
+			case '[':
+				stack = append(stack, ctxArray)
+			case '}':
+				stack = stack[:len(stack)-1]
+			case ']':
+				stack = stack[:len(stack)-1]
+			}
+			out.Write(raw)
+		case string:
+			if !isValue {
+				// 对象 key：原样保留（key 被替换会破坏结构语义）
+				out.Write(raw)
+				stack[len(stack)-1] = ctxObjExpectValue
+				prev = off
+				continue
+			}
+			masked := maskText(st, t, m)
+			if masked == t {
+				out.Write(raw)
+			} else {
+				out.Write(prefix)
+				out.Write(jsonEscapeString(masked))
+			}
+			if len(stack) > 0 && stack[len(stack)-1] == ctxObjExpectValue {
+				stack[len(stack)-1] = ctxObjExpectKey
+			}
+		default:
+			// 数字/布尔/null：原字节保留
+			out.Write(raw)
+			if len(stack) > 0 && stack[len(stack)-1] == ctxObjExpectValue {
+				stack[len(stack)-1] = ctxObjExpectKey
+			}
+		}
+		prev = off
+	}
+	out.Write(body[prev:])
+	return out.Bytes(), true
 }
 
 // sortedNames 返回去重、按长度降序的敏感名单（长名优先，避免短名先替换长名子串）。
@@ -428,4 +516,33 @@ func allPlaceholders(s string) []string {
 		}
 	}
 	return out
+}
+
+// jsonEscapeString 将字符串编码为带引号的 JSON 字符串字面量，仅转义 JSON 必需字符，
+// 保留 < > 原样（占位符 <<PII:...>> 依赖尖括号不被 \u003c 转义，便于响应还原匹配）。
+func jsonEscapeString(s string) []byte {
+	var b bytes.Buffer
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(&b, `\u%04x`, r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.Bytes()
 }
