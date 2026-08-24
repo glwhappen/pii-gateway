@@ -42,9 +42,10 @@ type appConfig struct {
 	PlaceholderPrefix string `json:"placeholder_prefix"` // 占位符前缀（重启生效，改后需清空旧映射）
 	PlaceholderSep    string `json:"placeholder_sep"`    // 占位符类型/编号分隔符
 	PlaceholderSuffix string `json:"placeholder_suffix"` // 占位符后缀
-	SystemHint        string `json:"system_hint"`        // 注入给上游模型的说明（提醒保留占位符），可热生效
+	SystemHint        string `json:"system_hint"`         // 注入给上游模型的说明（提醒保留占位符），可热生效
 	SystemHintEnabled string `json:"system_hint_enabled"` // 是否注入说明："on"/"off"，空用默认(关闭)
-	Names             []string `json:"names"`            // 敏感名单（姓名等），正文出现即掩码，可热生效
+	AdminToken        string `json:"admin_token"`         // 管理面板 Bearer 鉴权令牌；空则不鉴权(向后兼容)
+	Names             []string `json:"names"`             // 敏感名单（姓名等），正文出现即掩码，可热生效
 }
 
 // configStore 并发安全的配置存取。
@@ -70,6 +71,7 @@ func (s *configStore) load() {
 		PlaceholderSuffix: envOr("PII_PH_SUFFIX", ">>"),
 		SystemHint:        envOr("PII_SYSTEM_HINT", defaultSystemHint),
 		SystemHintEnabled: envOr("PII_SYSTEM_HINT_ENABLED", "off"),
+		AdminToken:        envOr("PII_ADMIN_TOKEN", ""),
 	}
 	s.mu.Lock()
 	s.c = def
@@ -117,6 +119,9 @@ func mergeNonEmpty(dst *appConfig, src *appConfig) {
 	if src.SystemHintEnabled != "" {
 		dst.SystemHintEnabled = src.SystemHintEnabled
 	}
+	if src.AdminToken != "" { // 注意：仅配置文件可设置，管理面板 /api/config 不暴露/不可改
+		dst.AdminToken = src.AdminToken
+	}
 	if src.Names != nil { // 名单：空数组与未设置可区分
 		dst.Names = src.Names
 	}
@@ -137,6 +142,13 @@ func (s *configStore) Target() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.c.ForwardTarget
+}
+
+// AdminToken 返回管理面板鉴权令牌（空表示未启用鉴权）。
+func (s *configStore) AdminToken() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.c.AdminToken
 }
 
 func (s *configStore) Get() appConfig {

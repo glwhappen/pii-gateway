@@ -89,24 +89,47 @@ func startAdmin() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveAdminPage)
 	mux.HandleFunc("/api/health", adminHealth)
-	mux.HandleFunc("/api/logs", adminLogs)
-	mux.HandleFunc("/api/rules", adminRules)
-	mux.HandleFunc("/api/rules/update", adminRuleUpdate)
-	mux.HandleFunc("/api/rules/remove", adminRuleRemove)
-	mux.HandleFunc("/api/config", adminConfig)
-	mux.HandleFunc("/api/names", adminNames)
-	mux.HandleFunc("/api/names/remove", adminNameRemove)
-	mux.HandleFunc("/api/mappings", adminMappings)
-	mux.HandleFunc("/api/mappings/ignore", adminMappingIgnore)
-	mux.HandleFunc("/api/mappings/delete", adminMappingDelete)
-	mux.HandleFunc("/api/mappings/clear", adminMappingsClear)
-	mux.HandleFunc("/api/self-test", adminSelfTest)
-	mux.HandleFunc("/api/self-test/history", adminSelftestHistory)
-	mux.HandleFunc("/api/self-test/history/clear", adminSelftestHistoryClear)
-	mux.HandleFunc("/api/self-test/history/remove", adminSelftestHistoryRemove)
+	mux.HandleFunc("/api/logs", authWrap(adminLogs))
+	mux.HandleFunc("/api/rules", authWrap(adminRules))
+	mux.HandleFunc("/api/rules/update", authWrap(adminRuleUpdate))
+	mux.HandleFunc("/api/rules/remove", authWrap(adminRuleRemove))
+	mux.HandleFunc("/api/config", authWrap(adminConfig))
+	mux.HandleFunc("/api/names", authWrap(adminNames))
+	mux.HandleFunc("/api/names/remove", authWrap(adminNameRemove))
+	mux.HandleFunc("/api/mappings", authWrap(adminMappings))
+	mux.HandleFunc("/api/mappings/ignore", authWrap(adminMappingIgnore))
+	mux.HandleFunc("/api/mappings/delete", authWrap(adminMappingDelete))
+	mux.HandleFunc("/api/mappings/clear", authWrap(adminMappingsClear))
+	mux.HandleFunc("/api/self-test", authWrap(adminSelfTest))
+	mux.HandleFunc("/api/self-test/history", authWrap(adminSelftestHistory))
+	mux.HandleFunc("/api/self-test/history/clear", authWrap(adminSelftestHistoryClear))
+	mux.HandleFunc("/api/self-test/history/remove", authWrap(adminSelftestHistoryRemove))
 	log.Printf("pii-gateway admin panel on %s", adminAddr)
 	if err := http.ListenAndServe(adminAddr, mux); err != nil {
 		log.Fatalf("admin server: %v", err)
+	}
+}
+
+// authWrap 为管理面板 API 添加 Bearer Token 鉴权。未配置 token 时放行（向后兼容）。
+func authWrap(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimSpace(appCfg.AdminToken())
+		if token == "" {
+			h(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if auth == "Bearer "+token || auth == "bearer "+token {
+			h(w, r)
+			return
+		}
+		// 兼容查询参数 token=xxx（便于 curl/脚本）。
+		if r.URL.Query().Get("token") == token {
+			h(w, r)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", `Bearer realm="pii-gateway-admin"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	}
 }
 
@@ -994,7 +1017,16 @@ a:hover{text-decoration:underline}
 
 <script>
 const $$ = id => document.getElementById(id);
-async function j(url,opt){const r=await fetch(url,opt);return r.json()}
+function adminToken(){ return localStorage.getItem('pii_admin_token') || '' }
+async function j(url,opt){
+  opt = opt || {};
+  opt.headers = opt.headers || {};
+  const t = adminToken();
+  if(t) opt.headers['Authorization'] = 'Bearer '+t;
+  const r=await fetch(url,opt);
+  if(r.status===401){ location.reload(); throw new Error('unauthorized'); }
+  return r.json()
+}
 
 async function refresh(){
   try{
@@ -1344,6 +1376,63 @@ func serveAdminPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	token := strings.TrimSpace(appCfg.AdminToken())
+	if token != "" {
+		auth := r.Header.Get("Authorization")
+		if auth != "Bearer "+token && auth != "bearer "+token {
+			// 未鉴权：返回登录页，前端提交 token 后携带 Authorization 重新加载。
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprint(w, adminLoginHTML)
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, adminPageHTML)
 }
+
+// adminLoginHTML 管理面板登录页（仅当配置了 AdminToken 时展示）。
+const adminLoginHTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PII 网关 · 登录</title>
+<style>
+body{background:#f7f8fa;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',sans-serif;color:#101828}
+.box{background:#fff;border:1px solid #e4e7ec;border-radius:12px;padding:32px;width:340px;box-shadow:0 1px 3px rgba(16,24,40,.08)}
+h1{font-size:20px;margin:0 0 6px}
+.sub{color:#667085;font-size:13px;margin-bottom:20px}
+input{width:100%;padding:10px 12px;border:1px solid #d0d5dd;border-radius:8px;font-size:14px;box-sizing:border-box}
+input:focus{outline:none;border-color:#4f46e5;box-shadow:0 0 0 3px #eef4ff}
+button{width:100%;margin-top:14px;padding:10px;background:#4f46e5;border:none;color:#fff;border-radius:8px;font-size:14px;cursor:pointer}
+button:hover{background:#4338ca}
+.err{color:#b42318;font-size:13px;margin-top:10px;display:none}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>🔒 PII 网关管理</h1>
+  <div class="sub">请输入访问令牌</div>
+  <input id="tok" type="password" placeholder="Admin Token" autocomplete="off" onkeydown="if(event.key==='Enter')doLogin()">
+  <button onclick="doLogin()">登录</button>
+  <div class="err" id="err">令牌错误，请重试</div>
+</div>
+<script>
+function doLogin(){
+  const tok = document.getElementById('tok').value.trim();
+  if(!tok) return;
+  fetch('/', {headers:{'Authorization':'Bearer '+tok}})
+    .then(r => {
+      if(r.ok && r.headers.get('content-type') && r.headers.get('content-type').includes('html')){
+        localStorage.setItem('pii_admin_token', tok);
+        location.reload();
+      } else {
+        document.getElementById('err').style.display='block';
+      }
+    })
+    .catch(()=>{ document.getElementById('err').style.display='block'; });
+}
+</script>
+</body>
+</html>
+`
