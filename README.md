@@ -1,0 +1,111 @@
+# PII 脱敏网关（pii-gateway）
+
+在 new-api（或其他 LLM API 网关）**前面**加一层独立反向代理：
+- **请求方向**：把手机号、身份证等 PII 替换为占位符，再转发给 new-api。
+- **响应方向**：把模型返回里的占位符还原成真实值，再返回给客户端。
+
+对调用方完全透明，**零改动 new-api**。这样 new-api 自己的日志、审计、计费里存的都是脱敏后的值，PII 不会进入 new-api 及上游。
+
+```
+客户端 ──▶ :3001  pii-gateway ──(脱敏后)──▶ new-api:3000 ──▶ 上游
+        ◀──────────────(还原后)─────────────────◀────────
+```
+
+## 架构与数据流
+
+```
+POST /v1/chat/completions (含 138xxxx 手机号/身份证)
+        │
+        ▼
+handleProxy: io.ReadAll(body) ─▶ mask() ─▶ 占位符 [[PID_N]] + 内存映射
+        │
+        ▼  透传原 Header（Authorization / Content-Type ...），只改 body
+http.Client.Do() ──▶ new-api（看到的是占位符）──▶ 上游模型
+        │
+        ▼
+响应分两种：
+  · 非流式 ── io.ReadAll ─▶ restore() ─▶ 写回
+  · SSE 流式 ── 逐行扫描 data: 行 ─▶ 每行 restore() ─▶ 写回并 Flush
+```
+
+映射表（占位符→真实值）在**单个请求**的调用栈内持有，用完即弃，不落盘、不共享，天然按请求隔离。
+
+## 构建与运行
+
+```bash
+cd pii-gateway
+go build -o pii-gateway .
+PII_LISTEN=:3001 PII_TARGET=http://localhost:3000 ./pii-gateway
+```
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PII_LISTEN` | `:3001` | 网关监听地址（客户端指向这里） |
+| `PII_TARGET` | `http://localhost:3000` | 转发目标（你的 new-api 地址） |
+| `PII_ADMIN` | `:9090` | 管理面板端口 |
+
+## 管理面板
+
+网关内置一个管理 Web 面板（独立端口，不干扰转发），浏览器打开 `http://<主机>:<PII_ADMIN>` 即可：
+
+- **状态卡片**：监听端口、转发目标、日志条数、当前时间
+- **脱敏自测**：输入一段含手机号/身份证的文本，离线演示「脱敏 → 还原」往返（不调模型），直观看到 `13812345678` 变成占位符再变回来
+- **实时转发日志**：每 1.5s 自动刷新，展示每次经过网关的请求的时间、IP、方法、路径、状态码、耗时、脱敏处数、还原处数，以及是否有占位符残留（还原失败信号）
+
+日志保存在内存环形缓冲（最多 2000 条），不落盘。
+
+### 当前运行实例
+
+```bash
+PII_LISTEN=:3002 PII_TARGET=http://localhost:3000 PII_ADMIN=:9088 ./pii-gateway
+```
+
+- 代理：`http://localhost:3002`
+- 管理面板：`http://localhost:9088`
+
+## 接入 new-api
+
+把客户端（各种 OpenAI SDK、ChatBox、NextChat 等）的 Base URL 从
+`http://你的主机:3000` 改为 **`http://你的主机:3001`**，其余（API key、模型名）完全不变。
+
+### Docker 部署示例
+
+在 new-api 的 `docker-compose.yml` 里加一个服务即可（需能访问 new-api 容器/宿主机）：
+
+```yaml
+  pii-gateway:
+    build: ./pii-gateway          # 指向本目录
+    container_name: pii-gateway
+    restart: always
+    ports:
+      - "3001:3001"
+    environment:
+      - PII_TARGET=http://new-api:3000   # 同 compose 网络内直接容器名
+```
+
+> 如果网关和 new-api 不在同一 Docker 网络，`PII_TARGET` 用 `http://宿主机IP:3000`。
+
+## 当前 PII 规则（mask.go）
+
+- 中国大陆手机号：`1[3-9][0-9]{9}`
+- 中国大陆身份证：`[0-9]{17}[0-9X]`
+
+占位符格式 `[[PID_N]]`（纯字母数字下划线，不破坏 JSON），模型通常原样回显，便于还原。
+
+## 测试
+
+```bash
+go test ./...
+```
+
+包含单元测试（脱敏/还原往返、JSON 结构保持、占位符任意位置拆分）和端到端测试（SSE 流式 + 非流式：脱敏→上游只见占位符→客户端拿到还原值）。
+
+## 局限与后续可做
+
+- **占位符被模型改写**：若模型不回显占位符、或改写成别的格式，还原会失败，客户端会看到 `[[PID_N]]`。
+- **跨 chunk 拆分已处理**：模型按 token 流式输出时，占位符可能被拆到相邻多个 `data:` 行的 content 字段里（甚至逐字拆）。网关按 content 值做跨行拼接（`carry` 状态机），支持任意拆分位置，还原后才写回客户端。
+- **只覆盖文本类接口**：当前对任意请求体做文本替换，对 embedding/image 等二进制也可能误匹配，建议只把 `/v1/chat/completions`、`/v1/responses` 等文本路由指向网关。
+- **更多 PII 类型**：银行卡（含 Luhn 校验）、邮箱、车牌号等可在 `mask.go` 加正则。
+- **假值替换 vs 占位符**：当前用占位符（最安全）。如需模型上下文更自然，可改为「替换成合法假值」+ 映射还原，但模型改写假号时还原不可靠。

@@ -1,0 +1,15 @@
+# 编译产物
+/pii-gateway
+*.exe
+
+# 日志
+*.log
+logs/
+
+# 本地运行数据
+/.pi/
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
