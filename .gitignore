@@ -16,3 +16,4 @@ logs/
 .vscode/
 .DS_Store
 /rules.json
+/pii-history.json

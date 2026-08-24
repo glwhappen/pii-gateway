@@ -42,6 +42,9 @@ func main() {
 	if err := globalRules.load(); err != nil {
 		log.Printf("load rules %s: %v", rulesFile, err)
 	}
+	if err := selftestHist.load(); err != nil {
+		log.Printf("load self-test history %s: %v", selftestHistFile, err)
+	}
 	go startAdmin()
 	log.Printf("pii-gateway listening on %s, forwarding to %s", listenAddr, appCfg.Target())
 	mux := http.NewServeMux()

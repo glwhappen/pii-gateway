@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -99,6 +100,9 @@ func startAdmin() {
 	mux.HandleFunc("/api/mappings/ignore", adminMappingIgnore)
 	mux.HandleFunc("/api/mappings/clear", adminMappingsClear)
 	mux.HandleFunc("/api/self-test", adminSelfTest)
+	mux.HandleFunc("/api/self-test/history", adminSelftestHistory)
+	mux.HandleFunc("/api/self-test/history/clear", adminSelftestHistoryClear)
+	mux.HandleFunc("/api/self-test/history/remove", adminSelftestHistoryRemove)
 	log.Printf("pii-gateway admin panel on %s", adminAddr)
 	if err := http.ListenAndServe(adminAddr, mux); err != nil {
 		log.Fatalf("admin server: %v", err)
@@ -456,27 +460,210 @@ func adminMappingsClear(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "size": 0})
 }
 
-// adminSelfTest 离线演示一次「脱敏 -> 还原」往返，不真正调用模型。
+// ---------------------------------------------------------------------------
+// 自测历史存储（服务端落盘，传输 AES-GCM 加密，同映射表）
+// ---------------------------------------------------------------------------
+
+type HistoryEntry struct {
+	ID       int64  `json:"id"`
+	Time     string `json:"time"`
+	Text     string `json:"text"`     // 输入（含 PII）
+	Masked   string `json:"masked"`   // 脱敏后
+	Restored string `json:"restored"` // 还原后（含 PII）
+	Count    int    `json:"count"`
+}
+
+// selftestHistory 环形历史存储，落盘持久化（文件 0600）。
+type selftestHistory struct {
+	mu   sync.Mutex
+	buf  []HistoryEntry
+	cap  int
+	seq  int64
+}
+
+var selftestHist = newSelftestHistory(100)
+
+// selftestHistFile 自测历史落盘路径（含 PII，权限 0600，不提交 git）。
+var selftestHistFile = envOr("PII_HISTORY_FILE", "pii-history.json")
+
+func newSelftestHistory(cap int) *selftestHistory {
+	return &selftestHistory{buf: make([]HistoryEntry, 0, cap), cap: cap}
+}
+
+func (h *selftestHistory) add(e HistoryEntry) {
+	h.mu.Lock()
+	h.seq++
+	e.ID = h.seq
+	e.Time = time.Now().Format("2006-01-02 15:04:05")
+	if len(h.buf) == h.cap {
+		copy(h.buf, h.buf[1:])
+		h.buf = h.buf[:h.cap-1]
+	}
+	h.buf = append(h.buf, e)
+	h.mu.Unlock()
+	_ = h.save()
+}
+
+func (h *selftestHistory) list() []HistoryEntry {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]HistoryEntry, len(h.buf))
+	copy(out, h.buf)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+	return out
+}
+
+func (h *selftestHistory) remove(id int64) bool {
+	h.mu.Lock()
+	found := false
+	for i := range h.buf {
+		if h.buf[i].ID == id {
+			h.buf = append(h.buf[:i], h.buf[i+1:]...)
+			found = true
+			break
+		}
+	}
+	h.mu.Unlock()
+	if found {
+		_ = h.save()
+	}
+	return found
+}
+
+func (h *selftestHistory) clear() {
+	h.mu.Lock()
+	h.buf = h.buf[:0]
+	h.mu.Unlock()
+	_ = h.save()
+}
+
+func (h *selftestHistory) load() error {
+	data, err := os.ReadFile(selftestHistFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var raw struct {
+		Entries []HistoryEntry `json:"entries"`
+		Seq     int64          `json:"seq"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	h.mu.Lock()
+	h.buf = raw.Entries
+	h.seq = raw.Seq
+	if len(h.buf) > h.cap {
+		h.buf = h.buf[len(h.buf)-h.cap:]
+	}
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *selftestHistory) save() error {
+	h.mu.Lock()
+	data, err := json.Marshal(map[string]any{"entries": h.buf, "seq": h.seq})
+	h.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	tmp := selftestHistFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, selftestHistFile)
+}
+
+// adminSelfTest 离线演示一次「脱敏 -> 还原」往返并记入历史。
+// 输入 Text、响应 masked/restored 均走 AES-GCM 加密（同映射表），历史服务端落盘。
 func adminSelfTest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var req struct {
-		Text string `json:"text"`
+		Text string `json:"text"` // 前端加密后发送
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	plain := strings.TrimSpace(req.Text)
+	if dec, err := mapDecrypt(plain); err == nil && dec != "" {
+		plain = strings.TrimSpace(dec)
+	}
+	if plain == "" {
+		http.Error(w, "text is required", http.StatusBadRequest)
+		return
+	}
 	m := newMapping()
-	masked := mask([]byte(req.Text), m)
+	masked := mask([]byte(plain), m)
 	restored := restore(masked, m)
+	selftestHist.add(HistoryEntry{Text: plain, Masked: string(masked), Restored: string(restored), Count: m.MaskedCount()})
+	// 响应同样加密，避免真实值明文传输
+	encMasked, _ := mapEncrypt(string(masked))
+	encRestored, _ := mapEncrypt(string(restored))
 	writeJSON(w, map[string]any{
-		"masked":   string(masked),
-		"restored": string(restored),
+		"masked":   encMasked,
+		"restored": encRestored,
 		"count":    m.MaskedCount(),
 	})
+}
+
+// adminSelftestHistory 返回自测历史（每条字段加密，前端解密显示）。
+func adminSelftestHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	entries := selftestHist.list()
+	enc := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		enc = append(enc, map[string]any{
+			"id":       e.ID,
+			"time":     e.Time,
+			"text":     mustEncrypt(e.Text),
+			"masked":   mustEncrypt(e.Masked),
+			"restored": mustEncrypt(e.Restored),
+			"count":    e.Count,
+		})
+	}
+	writeJSON(w, map[string]any{"entries": enc})
+}
+
+func mustEncrypt(s string) string {
+	e, _ := mapEncrypt(s)
+	return e
+}
+
+func adminSelftestHistoryClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	selftestHist.clear()
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func adminSelftestHistoryRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !selftestHist.remove(req.ID) {
+		http.Error(w, "记录不存在", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -804,49 +991,51 @@ async function runSelfTest(){
   const text = $$('selftest').value;
   if(!text){alert('请先输入文本');return}
   try{
-    const r = await j('/api/self-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
-    $$('maskedOut').textContent = r.masked;
-    $$('restoredOut').textContent = r.restored + (r.count? '\n（共脱敏 '+r.count+' 处）':'');
-    saveSelftestHistory(text, r);
+    // 输入加密后发送；响应中的真实值同样加密，前端解密显示（同映射表机制）
+    const enc = await encReal(text);
+    const r = await j('/api/self-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:enc})});
+    const masked = await decReal(r.masked);
+    const restored = await decReal(r.restored);
+    $$('maskedOut').textContent = masked;
+    $$('restoredOut').textContent = restored + (r.count? '\n（共脱敏 '+r.count+' 处）':'');
+    loadSelftestHistory(); // 历史已由服务端保存
   }catch(e){ $$('maskedOut').textContent='错误: '+e }
 }
-// ---- 自测历史（localStorage，本地持久）----
-const ST_HIST_KEY = 'pii_selftest_history';
-function saveSelftestHistory(text, r){
-  let h = [];
-  try{ h = JSON.parse(localStorage.getItem(ST_HIST_KEY)||'[]'); }catch(e){}
-  h.unshift({time:new Date().toLocaleString('zh-CN'), text, masked:r.masked, restored:r.restored, count:r.count||0});
-  if(h.length>30) h = h.slice(0,30);
-  localStorage.setItem(ST_HIST_KEY, JSON.stringify(h));
-  renderSelftestHistory();
+// ---- 自测历史（服务端存储，传输加密）----
+let stHistCache = []; // 解密缓存，供重测取回输入
+async function loadSelftestHistory(){
+  stHistCache = [];
+  try{
+    const d = await j('/api/self-test/history');
+    const rows = await Promise.all(d.entries.map(async e=>{
+      let text='', masked='', restored='';
+      try{ text = await decReal(e.text); masked = await decReal(e.masked); restored = await decReal(e.restored); }catch(err){}
+      stHistCache.push({id:e.id, text, masked, restored});
+      return '<tr><td>'+escapeHtml(e.time)+'</td><td title="'+escapeHtml(text)+'">'+escapeHtml(truncate(text,26))+'</td><td>'+e.count+'</td>'+
+        '<td><button class="secondary" style="padding:3px 10px;margin-right:6px" onclick="rerunSelftest('+e.id+')">🔄 重测</button>'+
+        '<button class="danger" style="padding:3px 10px" onclick="removeSelftestHistory('+e.id+')">删除</button></td></tr>';
+    }));
+    $$('stHistory').innerHTML = rows.length? '<div style="overflow-x:auto"><table><thead><tr><th>时间</th><th>输入</th><th>脱敏</th><th style="width:150px"></th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>' : '<div class="muted" style="margin-top:6px">暂无历史</div>';
+  }catch(e){}
 }
-function renderSelftestHistory(){
-  let h = [];
-  try{ h = JSON.parse(localStorage.getItem(ST_HIST_KEY)||'[]'); }catch(e){}
-  if(!h.length){ $$('stHistory').innerHTML='<div class="muted" style="margin-top:6px">暂无历史</div>'; return; }
-  $$('stHistory').innerHTML = '<div style="overflow-x:auto"><table><thead><tr><th>时间</th><th>输入</th><th>脱敏</th><th style="width:150px"></th></tr></thead><tbody>'+
-    h.map((x,i)=>'<tr><td>'+escapeHtml(x.time)+'</td><td title="'+escapeHtml(x.text)+'">'+escapeHtml(truncate(x.text,26))+'</td><td>'+x.count+'</td>'+
-      '<td><button class="secondary" style="padding:3px 10px;margin-right:6px" onclick="rerunSelftest('+i+')">🔄 重测</button>'+
-      '<button class="danger" style="padding:3px 10px" onclick="removeSelftestHistory('+i+')">删除</button></td></tr>').join('')+'</tbody></table></div>';
+function rerunSelftest(id){
+  const x = stHistCache.find(e=>e.id===id);
+  if(!x) return;
+  $$('selftest').value = x.text; // 填回输入框
+  runSelftest();                 // 重新测试（服务端会新增一条历史）
 }
-function rerunSelftest(i){
-  let h = [];
-  try{ h = JSON.parse(localStorage.getItem(ST_HIST_KEY)||'[]'); }catch(e){}
-  if(!h[i]) return;
-  $$('selftest').value = h[i].text; // 填回输入框
-  runSelftest();                    // 重新测试（会记录新历史）
+async function removeSelftestHistory(id){
+  try{
+    await j('/api/self-test/history/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+    loadSelftestHistory();
+  }catch(e){ alert('删除失败: '+e) }
 }
-function removeSelftestHistory(i){
-  let h = [];
-  try{ h = JSON.parse(localStorage.getItem(ST_HIST_KEY)||'[]'); }catch(e){}
-  h.splice(i,1);
-  localStorage.setItem(ST_HIST_KEY, JSON.stringify(h));
-  renderSelftestHistory();
-}
-function clearSelftestHistory(){
+async function clearSelftestHistory(){
   if(!confirm('确定清空自测历史？')) return;
-  localStorage.removeItem(ST_HIST_KEY);
-  renderSelftestHistory();
+  try{
+    await j('/api/self-test/history/clear',{method:'POST'});
+    loadSelftestHistory();
+  }catch(e){ alert('清空失败: '+e) }
 }
 
 function truncate(s, n){
@@ -1032,7 +1221,7 @@ function switchTab(name){
   else if(name==='rules') loadRules();
   else if(name==='names') loadNames();
   else if(name==='mappings') loadMappings();
-  else if(name==='selftest') renderSelftestHistory();
+  else if(name==='selftest') loadSelftestHistory();
 }
 
 function applyTheme(t){
