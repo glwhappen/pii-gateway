@@ -88,6 +88,8 @@ func startAdmin() {
 	mux.HandleFunc("/api/health", adminHealth)
 	mux.HandleFunc("/api/logs", adminLogs)
 	mux.HandleFunc("/api/rules", adminRules)
+	mux.HandleFunc("/api/mappings", adminMappings)
+	mux.HandleFunc("/api/mappings/clear", adminMappingsClear)
 	mux.HandleFunc("/api/self-test", adminSelfTest)
 	log.Printf("pii-gateway admin panel on %s", adminAddr)
 	if err := http.ListenAndServe(adminAddr, mux); err != nil {
@@ -113,6 +115,22 @@ func adminLogs(w http.ResponseWriter, r *http.Request) {
 
 func adminRules(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, rulesList)
+}
+
+func adminMappings(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{
+		"size":    globalStore.size(),
+		"entries": globalStore.list(),
+	})
+}
+
+func adminMappingsClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	globalStore.clear()
+	writeJSON(w, map[string]any{"ok": true, "size": 0})
 }
 
 // adminSelfTest 离线演示一次「脱敏 -> 还原」往返，不真正调用模型。
@@ -200,6 +218,17 @@ a{color:var(--accent)}
   </div>
 
   <div class="panel">
+    <h2>🗺️ 映射表 <span class="muted">(<span id="mapCount">0</span> 条 · 同一内容跨请求复用同一占位符)</span>
+      <button style="float:right" onclick="clearMappings()">🗑️ 清除全部</button>
+    </h2>
+    <div style="overflow-x:auto"><table>
+      <thead><tr><th>占位符</th><th>真实值</th></tr></thead>
+      <tbody id="mapBody"></tbody>
+    </table></div>
+    <div class="muted" id="mapEmpty" style="margin-top:10px">暂无映射</div>
+  </div>
+
+  <div class="panel">
     <h2>🧾 实时转发日志 <span class="muted">(<span id="logCount">0</span> 条，自动刷新)</span></h2>
     <div style="overflow-x:auto"><table>
       <thead><tr><th>时间</th><th>IP</th><th>方法</th><th>路径</th><th>状态</th><th>耗时</th><th>脱敏</th><th>还原</th><th>残留</th></tr></thead>
@@ -250,8 +279,25 @@ async function runSelfTest(){
   }catch(e){ $$('maskedOut').textContent='错误: '+e }
 }
 
+async function loadMappings(){
+  try{
+    const d = await j('/api/mappings');
+    $$('mapCount').textContent = d.size;
+    $$('mapBody').innerHTML = d.entries.map(e=>'<tr><td>'+e.placeholder+'</td><td>'+e.real+'</td></tr>').join('');
+    $$('mapEmpty').style.display = d.size? 'none':'block';
+  }catch(e){}
+}
+async function clearMappings(){
+  if(!confirm('确定清除全部映射？清除后同一内容会重新分配新的占位符。')) return;
+  try{
+    await j('/api/mappings/clear',{method:'POST'});
+    loadMappings(); refresh();
+  }catch(e){ alert('清除失败: '+e) }
+}
+
 refresh();
-setInterval(refresh, 1500);
+setInterval(()=>{ refresh(); loadMappings(); }, 1500);
+loadMappings();
 </script>
 </body>
 </html>

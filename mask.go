@@ -2,6 +2,7 @@ package main
 
 import (
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,6 +54,42 @@ func (s *piiStore) size() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.real2ph)
+}
+
+// mappingEntry 一条 占位符 <-> 真实值 映射（供管理面板展示）。
+type mappingEntry struct {
+	Placeholder string `json:"placeholder"`
+	Real        string `json:"real"`
+}
+
+// list 返回全部映射，按占位符编号升序。
+func (s *piiStore) list() []mappingEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]mappingEntry, 0, len(s.real2ph))
+	for real, ph := range s.real2ph {
+		out = append(out, mappingEntry{Placeholder: ph, Real: real})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return phNumber(out[i].Placeholder) < phNumber(out[j].Placeholder)
+	})
+	return out
+}
+
+// clear 清空全部映射。
+func (s *piiStore) clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.real2ph = make(map[string]string)
+	s.ph2real = make(map[string]string)
+}
+
+// phNumber 解析占位符里的编号 [[PID_123]] -> 123。
+func phNumber(ph string) int {
+	s := strings.TrimPrefix(ph, "[[PID_")
+	s = strings.TrimSuffix(s, "]]")
+	n, _ := strconv.Atoi(s)
+	return n
 }
 
 // ResetPIIStore 清空全局映射（供测试或管理面板调用）。
