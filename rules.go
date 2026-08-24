@@ -29,8 +29,14 @@ var rulesFile = envOr("PII_RULES_FILE", "rules.json")
 
 func defaultRules() []Rule {
 	return []Rule{
+		// 银行卡放最前（BIN 前缀，避免 19 位卡被身份证规则截断）
+		{Name: "银行卡号", Pattern: `(?:62\d{14,17}|4\d{15}|5[1-5]\d{14})`, Sample: "6222021234567890123"},
 		{Name: "中国大陆身份证", Pattern: `(?i)[0-9]{17}[0-9X]`, Sample: "110101199003071234"},
 		{Name: "中国大陆手机号", Pattern: `1[3-9][0-9]{9}`, Sample: "13812345678"},
+		{Name: "邮箱", Pattern: `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`, Sample: "abc@test.com"},
+		{Name: "中国大陆车牌", Pattern: `[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领][A-HJ-NP-Z][A-HJ-NP-Z0-9]{5,6}`, Sample: "粤B12345"},
+		{Name: "固定电话", Pattern: `0\d{2,3}-?\d{7,8}`, Sample: "0755-12345678"},
+		{Name: "中国护照", Pattern: `(?i)[eghpsd]\d{8}`, Sample: "E12345678"},
 	}
 }
 
