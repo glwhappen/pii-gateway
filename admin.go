@@ -885,6 +885,10 @@ a:hover{text-decoration:underline}
 
   <div class="panel" data-tab="selftest">
     <h2>🧪 脱敏自测（不调模型，直接演示）</h2>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      <span class="muted">示例：</span>
+      <div id="stSamples" style="display:inline-flex;gap:6px;flex-wrap:wrap"></div>
+    </div>
     <textarea id="selftest" placeholder="输入包含手机号/身份证的文本，例如：我的电话是13812345678，身份证110101199003071234"></textarea>
     <div style="margin-top:10px"><button onclick="runSelfTest()">运行自测</button></div>
     <div class="pair">
@@ -1012,6 +1016,24 @@ async function runSelfTest(){
     $$('restoredOut').textContent = restored + (r.count? '\n（共脱敏 '+r.count+' 处）':'');
     loadSelftestHistory(); // 历史已由服务端保存
   }catch(e){ $$('maskedOut').textContent='错误: '+e }
+}
+// ---- 自测示例（一键填入并运行）----
+const SELFTEST_SAMPLES = [
+  {label:'📱 基础号码', text:'我的电话是13812345678，身份证110101199003071234'},
+  {label:'🧾 混合信息', text:'联系张三：13812345678，邮箱zs@test.com，车牌粤B12345，护照E12345678'},
+  {label:'🌐 网络/凭证', text:'服务器IP 192.168.1.100，MAC aa:bb:cc:dd:ee:ff，key sk-abcdefghijklmnopqrstuvwxyz123456'},
+  {label:'🔁 重复出现', text:'手机13811112222，再说一遍13811112222，确认13811112222'},
+  {label:'🧱 长文重叠', text:'卡号6222021234567890123与身份证110101199003071234都需要保护'},
+  {label:'✅ 无敏感', text:'今天天气不错，我们去公园散步吧。'},
+  {label:'🎫 凭证token', text:'Authorization: Bearer eyJ0eXAiOiJKV1QifQ.abc.defghijklmnopqrstuvwxyz，Github ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456'},
+];
+function renderSelftestSamples(){
+  $$('stSamples').innerHTML = SELFTEST_SAMPLES.map((s,i)=>'<button class="secondary" style="padding:3px 12px" onclick="runExample('+i+')">'+escapeHtml(s.label)+'</button>').join(' ');
+}
+function runExample(i){
+  if(!SELFTEST_SAMPLES[i]) return;
+  $$('selftest').value = SELFTEST_SAMPLES[i].text; // 填入输入框
+  runSelfTest();                                 // 立即运行
 }
 // ---- 自测历史（服务端存储，传输加密）----
 let stHistCache = []; // 解密缓存，供重测取回输入
@@ -1233,7 +1255,7 @@ function switchTab(name){
   else if(name==='rules') loadRules();
   else if(name==='names') loadNames();
   else if(name==='mappings') loadMappings();
-  else if(name==='selftest') loadSelftestHistory();
+  else if(name==='selftest'){ renderSelftestSamples(); loadSelftestHistory(); }
 }
 
 function applyTheme(t){
