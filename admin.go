@@ -916,29 +916,43 @@ async function decReal(b64){
   const pt = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, ct);
   return new TextDecoder().decode(pt);
 }
+// 解密结果缓存：占位符 -> 真实值，避免每次刷新都重新 AES 解密（解密是主要卡顿来源）。
+const realCache = {};
+async function cachedReal(e){
+  if(!(e.placeholder in realCache)){
+    try{ realCache[e.placeholder] = await decReal(e.real); }
+    catch(err){ realCache[e.placeholder] = e.real; }
+  }
+  return realCache[e.placeholder];
+}
 async function loadMappings(){
   try{
     const d = await j('/api/mappings');
     const f = ($$('mapFilter').value||'').toLowerCase();
     const filtered = f? d.entries.filter(e=>e.placeholder.toLowerCase().includes(f)) : d.entries;
     const rows = await Promise.all(filtered.map(async e=>{
-      let real = e.real;
-      try{ real = await decReal(e.real); }catch(err){}
+      const real = await cachedReal(e);
       const ig = !!e.ignored;
       // 占位符 <<PII:...>> 含 < >，必须 HTML 转义，否则被当标签吞掉只剩 <>
       return '<tr><td>'+escapeHtml(e.placeholder)+'</td><td>'+escapeHtml(real)+'</td>'+
-        '<td><button class="'+(ig?'':'secondary')+'" style="padding:3px 12px" onclick="toggleIgnore('+escapeHtml(JSON.stringify(e.placeholder))+','+ig+')">'+(ig?'✅ 已忽略':'忽略')+'</button></td></tr>';
+        '<td><button class="'+(ig?'':'secondary')+'" style="padding:3px 12px" onclick="toggleIgnore('+escapeHtml(JSON.stringify(e.placeholder))+','+ig+', this)">'+(ig?'✅ 已忽略':'忽略')+'</button></td></tr>';
     }));
     $$('mapCount').textContent = d.size;
     $$('mapBody').innerHTML = rows.join('') || '<tr class="empty-row"><td colspan="3">无匹配项</td></tr>';
     $$('mapEmpty').style.display = d.size? 'none':'block';
   }catch(e){}
 }
-async function toggleIgnore(ph, cur){
+// 乐观更新：点击立即切换按钮状态，不等接口返回，失败再回滚。
+async function toggleIgnore(ph, cur, btn){
+  const now = !cur;
+  if(btn){ btn.textContent = now? '✅ 已忽略':'忽略'; btn.className = now? '':'secondary'; }
   try{
-    await j('/api/mappings/ignore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({placeholder:ph, ignored:!cur})});
+    await j('/api/mappings/ignore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({placeholder:ph, ignored:now})});
     loadMappings();
-  }catch(e){ alert('操作失败: '+e) }
+  }catch(e){
+    if(btn){ btn.textContent = cur? '✅ 已忽略':'忽略'; btn.className = cur? '':'secondary'; }
+    alert('操作失败: '+e);
+  }
 }
 async function addMapping(){
   const real = $$('newReal').value.trim();
