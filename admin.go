@@ -96,6 +96,7 @@ func startAdmin() {
 	mux.HandleFunc("/api/names", adminNames)
 	mux.HandleFunc("/api/names/remove", adminNameRemove)
 	mux.HandleFunc("/api/mappings", adminMappings)
+	mux.HandleFunc("/api/mappings/ignore", adminMappingIgnore)
 	mux.HandleFunc("/api/mappings/clear", adminMappingsClear)
 	mux.HandleFunc("/api/self-test", adminSelfTest)
 	log.Printf("pii-gateway admin panel on %s", adminAddr)
@@ -369,13 +370,17 @@ func adminMappings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		entries := globalStore.list()
-		encEntries := make([]map[string]string, 0, len(entries))
+		encEntries := make([]map[string]any, 0, len(entries))
 		for _, e := range entries {
 			er, err := mapEncrypt(e.Real)
 			if err != nil {
 				er = e.Real // 加密失败回退明文（理论上不会发生）
 			}
-			encEntries = append(encEntries, map[string]string{"placeholder": e.Placeholder, "real": er})
+			encEntries = append(encEntries, map[string]any{
+				"placeholder": e.Placeholder,
+				"real":        er,
+				"ignored":     globalStore.isIgnored(e.Real),
+			})
 		}
 		writeJSON(w, map[string]any{
 			"size":    globalStore.size(),
@@ -419,6 +424,27 @@ func adminMappingsAdd(w http.ResponseWriter, r *http.Request) {
 		log.Printf("save pii store: %v", err)
 	}
 	writeJSON(w, map[string]any{"placeholder": ph, "real": enc, "new": true})
+}
+
+// adminMappingIgnore 按占位符切换某条映射的忽略状态（忽略后不再脱敏该真实值，可恢复）。
+func adminMappingIgnore(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Placeholder string `json:"placeholder"`
+		Ignored     bool   `json:"ignored"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := globalStore.setIgnored(req.Placeholder, req.Ignored); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func adminMappingsClear(w http.ResponseWriter, r *http.Request) {
@@ -716,8 +742,11 @@ a:hover{text-decoration:underline}
       <input id="newReal" style="flex:1" class="inp" placeholder="手动添加真实值，如 1111 —— 自动分配占位符" onkeydown="if(event.key==='Enter')addMapping()">
       <button onclick="addMapping()">➕ 添加</button>
     </div>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <input id="mapFilter" class="inp" style="flex:1" placeholder="🔍 按占位符过滤，如 PHONE 或 <<PII:PHONE:1>>" oninput="loadMappings()">
+    </div>
     <div style="overflow-x:auto"><table>
-      <thead><tr><th>占位符</th><th>真实值</th></tr></thead>
+      <thead><tr><th>占位符</th><th>真实值</th><th style="width:90px">忽略</th></tr></thead>
       <tbody id="mapBody"></tbody>
     </table></div>
     <div class="muted" id="mapEmpty" style="margin-top:10px">暂无映射</div>
@@ -890,16 +919,26 @@ async function decReal(b64){
 async function loadMappings(){
   try{
     const d = await j('/api/mappings');
-    const rows = await Promise.all(d.entries.map(async e=>{
+    const f = ($$('mapFilter').value||'').toLowerCase();
+    const filtered = f? d.entries.filter(e=>e.placeholder.toLowerCase().includes(f)) : d.entries;
+    const rows = await Promise.all(filtered.map(async e=>{
       let real = e.real;
       try{ real = await decReal(e.real); }catch(err){}
+      const ig = !!e.ignored;
       // 占位符 <<PII:...>> 含 < >，必须 HTML 转义，否则被当标签吞掉只剩 <>
-      return '<tr><td>'+escapeHtml(e.placeholder)+'</td><td>'+escapeHtml(real)+'</td></tr>';
+      return '<tr><td>'+escapeHtml(e.placeholder)+'</td><td>'+escapeHtml(real)+'</td>'+
+        '<td><button class="'+(ig?'':'secondary')+'" style="padding:3px 12px" onclick="toggleIgnore('+escapeHtml(JSON.stringify(e.placeholder))+','+ig+')">'+(ig?'✅ 已忽略':'忽略')+'</button></td></tr>';
     }));
     $$('mapCount').textContent = d.size;
-    $$('mapBody').innerHTML = rows.join('');
+    $$('mapBody').innerHTML = rows.join('') || '<tr class="empty-row"><td colspan="3">无匹配项</td></tr>';
     $$('mapEmpty').style.display = d.size? 'none':'block';
   }catch(e){}
+}
+async function toggleIgnore(ph, cur){
+  try{
+    await j('/api/mappings/ignore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({placeholder:ph, ignored:!cur})});
+    loadMappings();
+  }catch(e){ alert('操作失败: '+e) }
 }
 async function addMapping(){
   const real = $$('newReal').value.trim();

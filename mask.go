@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
@@ -18,6 +19,7 @@ type piiStore struct {
 	mu      sync.Mutex
 	real2ph map[string]string
 	ph2real map[string]string
+	ignored map[string]bool // 被忽略的真实值：不再参与脱敏（保留记录，可取消忽略）
 }
 
 var globalStore = newPIIStore()
@@ -26,7 +28,7 @@ var globalStore = newPIIStore()
 var piiStoreFile = envOr("PII_STORE_FILE", "pii-store.json")
 
 func newPIIStore() *piiStore {
-	return &piiStore{real2ph: make(map[string]string), ph2real: make(map[string]string)}
+	return &piiStore{real2ph: make(map[string]string), ph2real: make(map[string]string), ignored: make(map[string]bool)}
 }
 
 func (s *piiStore) lookup(real string) (string, bool) {
@@ -58,6 +60,7 @@ func (s *piiStore) loadFile(path string) error {
 	}
 	var raw struct {
 		Real2ph map[string]string `json:"real2ph"`
+		Ignored []string          `json:"ignored,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -66,6 +69,10 @@ func (s *piiStore) loadFile(path string) error {
 	defer s.mu.Unlock()
 	s.real2ph = raw.Real2ph
 	s.ph2real = make(map[string]string, len(raw.Real2ph))
+	s.ignored = make(map[string]bool, len(raw.Ignored))
+	for _, real := range raw.Ignored {
+		s.ignored[real] = true
+	}
 	var max uint64
 	for real, ph := range s.real2ph {
 		s.ph2real[ph] = real
@@ -80,7 +87,12 @@ func (s *piiStore) loadFile(path string) error {
 // saveFile 原子落盘（写临时文件后 rename），权限 0600。
 func (s *piiStore) saveFile(path string) error {
 	s.mu.Lock()
-	data, err := json.Marshal(map[string]any{"real2ph": s.real2ph})
+	ignoredArr := make([]string, 0, len(s.ignored))
+	for real := range s.ignored {
+		ignoredArr = append(ignoredArr, real)
+	}
+	sort.Strings(ignoredArr)
+	data, err := json.Marshal(map[string]any{"real2ph": s.real2ph, "ignored": ignoredArr})
 	s.mu.Unlock()
 	if err != nil {
 		return err
@@ -123,8 +135,33 @@ func (s *piiStore) clear() {
 	s.mu.Lock()
 	s.real2ph = make(map[string]string)
 	s.ph2real = make(map[string]string)
+	s.ignored = make(map[string]bool)
 	s.mu.Unlock()
 	_ = s.saveFile(piiStoreFile)
+}
+
+// isIgnored 判断某真实值是否已被忽略（忽略后不再脱敏）。
+func (s *piiStore) isIgnored(real string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ignored[real]
+}
+
+// setIgnored 按占位符设置忽略状态（忽略后该真实值不再脱敏，保留记录可恢复）。
+func (s *piiStore) setIgnored(ph string, ig bool) error {
+	s.mu.Lock()
+	real, ok := s.ph2real[ph]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("占位符 %q 不存在", ph)
+	}
+	if ig {
+		s.ignored[real] = true
+	} else {
+		delete(s.ignored, real)
+	}
+	s.mu.Unlock()
+	return s.saveFile(piiStoreFile)
 }
 
 // ResetPIIStore 清空全局映射（供测试或管理面板调用）。
@@ -164,6 +201,9 @@ func mask(body []byte, m *mapping) []byte {
 	// 敏感名单（姓名等）：正文出现即掩码，确定性复用同一占位符。
 	// 按长度降序处理，避免短名先替换长名内的子串。
 	for _, nm := range sortedNames() {
+		if globalStore.isIgnored(nm) {
+			continue // 该词已被忽略，不脱敏
+		}
 		if !strings.Contains(s, nm) {
 			continue
 		}
@@ -221,6 +261,9 @@ func (s *piiStore) manualEntries() []mappingEntry {
 	defer s.mu.Unlock()
 	var out []mappingEntry
 	for real, ph := range s.real2ph {
+		if s.ignored[real] {
+			continue // 已被忽略，不参与手动替换
+		}
 		if globalRules.matches(real) {
 			continue // 这类已由正则规则处理
 		}
@@ -232,6 +275,10 @@ func (s *piiStore) manualEntries() []mappingEntry {
 func maskOne(real string, m *mapping, typ string) string {
 	// 已替换过的占位符不再重复处理
 	if placeholderRe.MatchString(real) {
+		return real
+	}
+	// 该真实值已被忽略：不脱敏，保留明文
+	if globalStore.isIgnored(real) {
 		return real
 	}
 	// 同一内容跨请求复用同一占位符（确定性脱敏）
